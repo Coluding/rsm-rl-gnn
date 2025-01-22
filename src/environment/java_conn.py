@@ -1,7 +1,16 @@
 from contextlib import contextmanager
-from typing import List
+from typing import List, Union, Any, Dict
 import jpype
 import jpype.imports
+from dataclasses import dataclass
+
+@dataclass
+class FluidityStepResult:
+    distance_latencies: Dict[str, Dict[str, float]]
+    mean_delay: float
+    active_locations: List[str]
+    passive_locations: List[str]
+    finished: bool = False
 
 
 @contextmanager
@@ -32,6 +41,7 @@ class JavaSimulator:
         self.FluiditySimulationExecutionFactory = "de.optscore.simulation.fluidity.FluiditySimulationExecutionFactory"
         self.FluiditySimulationConfiguration = "de.optscore.simulation.fluidity.configuration.FluiditySimulationConfiguration"
         self.FluidityStepAction = "de.optscore.simulation.fluidity.step.FluidityStepAction"
+        self.FluiditySimulation = "de.optscore.simulation.fluidity.FluiditySimulation"
         self.DefaultOptimizationInstructions = "bftsmart.location.management.exploration.DefaultOptimizationInstructions"
         self.ArrayList = "java.util.ArrayList"
 
@@ -44,6 +54,7 @@ class JavaSimulator:
 
         # Load Java classes
         self.Simulator = jpype.JClass(self.FluiditySimulator)
+        self.Simulation = jpype.JClass(self.FluiditySimulation)
         self.ExecutionFactory = jpype.JClass(self.FluiditySimulationExecutionFactory)
         self.Execution = jpype.JClass(self.FluiditySimulationExecution)
         self.Config = jpype.JClass(self.FluiditySimulationConfiguration)
@@ -57,17 +68,28 @@ class JavaSimulator:
 
         self.simulator = self.Simulator(configuration_directory_simulator, self.node_identifier)
         self.config = self.Config(self.config_dir, self.node_identifier)
+        self.simulation = self.Simulation(self.config.getSelf(), self.config.getXmrConfigurationDirectory(), self.config)
         self.execution = self.ExecutionFactory().create(self.config)
+        self.internal_step = 0
 
 
-    def step(self, action: int):
+    def step(self, action: int) -> FluidityStepResult:
         instruction = self._convert_action(action)
         step_action = self.StepAction(instruction)
         step_result = self.execution.executeStep(step_action)
-        client_latencies = step_result.getSystemLatencies().getReplicaClientLatencies()
-        replica_latencies = step_result.getSystemLatencies().getReplicaLatencies()
+        client_latencies = step_result.getState().getSystemLatencies().getReplicaClientLatencies()
+        replica_latencies = step_result.getState().getSystemLatencies().getReplicaLatencies()
+        self.internal_step += 1
 
-        return self._convert_step_result(client_latencies, replica_latencies)
+        active_locations = [x.getLocation().identify() for x in step_result.getState().getView().getActiveView().getNodes()]
+        passive_locations = [x.getLocation().identify() for x in step_result.getState().getView().getPassiveView().getNodes()]
+        mean_latency = step_result.getState().getAverageCalculation().getAverageLatency()
+
+        return FluidityStepResult(distance_latencies=self._convert_step_result(client_latencies, replica_latencies),
+                                  mean_delay=mean_latency,
+                                  active_locations=active_locations,
+                                  passive_locations=passive_locations,
+                                  finished=False)
 
     def _convert_step_result(self, client_latencies, replica_latencies):
         parsed_client_lats = {entry.getKey().getLocation().identify(): entry.getValue() for entry in client_latencies.entrySet()}
@@ -110,4 +132,5 @@ if __name__ == "__main__":
 
     )
 
+    conn.step(1)
     conn.step(1)
