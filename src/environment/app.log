@@ -1,5 +1,0 @@
-2025-01-22 14:15:49,001 - DEBUG - env_logging.py:50 - <module> - This is a debug message.
-2025-01-22 14:15:49,001 - INFO - env_logging.py:51 - <module> - This is an info message.
-2025-01-22 14:15:49,002 - WARNING - env_logging.py:52 - <module> - This is a warning.
-2025-01-22 14:15:49,002 - ERROR - env_logging.py:53 - <module> - This is an error.
-2025-01-22 14:15:49,002 - CRITICAL - env_logging.py:54 - <module> - This is a critical error.
