@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from abc import ABC, abstractmethod
+import torch.nn.functional as F
 
 from src.models.encoder import BaseSpatialEncoder, BaseTemporalEncoder
 
@@ -23,6 +24,42 @@ class BaseAggregator(ABC):
         assert len(x.shape) == 3, "Input tensor must have shape (B, N, D)"
         self.assert_called = True
 
+class SwapActionMapper(ABC):
+    def __init__(self, num_locations: int):
+        self.assert_called = False
+        self.num_locations = num_locations
+
+    @abstractmethod
+    def forward(self, x):
+        """
+        The action mapper expects a torch.Tensor as input with the following shape:
+       - (B,D) where B is the batch size, and D is the dimension of the aggregated temporal node embeddings
+
+        Args:
+            x: torch.Tensor: The input tensor of shape (B, D)
+        Returns:
+            torch.Tensor: The output tensor of shape (B, 2)
+        """
+        assert len(x.shape) == 2, "Input tensor must have shape (B, D)"
+        self.assert_called = True
+
+class SwapActionNodeMapper(ABC):
+    def __init__(self, num_locations: int):
+        self.assert_called = False
+        self.num_locations = num_locations
+
+    @abstractmethod
+    def forward(self, x):
+        """
+        The action mapper expects a torch.Tensor as input with the following shape:
+       - (B,N,D) where B is the batch size, N is the number of nodes, and D is the dimension of the aggregated temporal node embeddings
+       Args:
+            x: torch.Tensor: The input tensor of shape (B, N, D)
+        Returns:
+            torch.Tensor: The output tensor of shape (B, N, 2)
+        """
+        assert len(x.shape) == 3, "Input tensor must have shape (B, N, D)"
+        self.assert_called = True
 
 
 class MeanAggregator(BaseAggregator, nn.Module):
@@ -53,83 +90,298 @@ class SumAggregator(BaseAggregator, nn.Module):
         BaseAggregator.forward(self, x)
         return torch.sum(x, dim=1)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-class BaseAggregator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.assert_called = False
-
-    def forward(self, x):
-        assert len(x.shape) == 3, f"Expected input of shape (B, N, D), got {x.shape}"
-        self.assert_called = True
-
-
-class AttentionAggregator(BaseAggregator):
-    def __init__(self, input_dim: int, hidden_dim: int, type: str = "scaled_dot", num_heads: int = 4):
-        super().__init__()
-        self.type = type
-        self.num_heads = num_heads
-
-        # Projection layers
-        self.q = nn.Linear(input_dim, hidden_dim)
-        self.k = nn.Linear(input_dim, hidden_dim)
-        self.v = nn.Linear(input_dim, hidden_dim)
-
-        # Additive attention parameters
-        if type == "additive":
-            self.additive_w = nn.Linear(2 * hidden_dim, hidden_dim)
-            self.additive_v = nn.Linear(hidden_dim, 1)
-
-        # Multi-head Attention
-        if type == "multihead":
-            self.q_heads = nn.Linear(input_dim, hidden_dim * num_heads)
-            self.k_heads = nn.Linear(input_dim, hidden_dim * num_heads)
-            self.v_heads = nn.Linear(input_dim, hidden_dim * num_heads)
-            self.output_projection = nn.Linear(hidden_dim * num_heads, hidden_dim)
-
-        if type == "gated":
-            self.gate = nn.Linear(hidden_dim, 1)
+class AdditiveAttention(BaseAggregator, nn.Module):
+    """Bahdanau-style additive attention."""
+    def __init__(self, input_dim, hidden_dim):
+        BaseAggregator.__init__(self)
+        nn.Module.__init__(self)
+        self.W = nn.Linear(input_dim, hidden_dim)  # Transform input
+        self.v = nn.Linear(hidden_dim, 1)  # Score projection
 
     def forward(self, x):
-        super().forward(x)  # Ensure base class validation
+        B, N, D = x.shape
+        energy = torch.tanh(self.W(x))  # (B, N, hidden_dim)
+        attn_scores = self.v(energy).squeeze(-1)  # (B, N)
+        attn_weights = F.softmax(attn_scores, dim=1)  # Normalize
+        aggregated = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, D)
+        return aggregated, attn_weights
+
+
+class ScaledDotProductAttention(BaseAggregator, nn.Module):
+    """Transformer-style scaled dot-product attention."""
+    def __init__(self, input_dim):
+        BaseAggregator.__init__(self)
+        nn.Module.__init__(self)
+        self.q = nn.Linear(input_dim, input_dim)
+        self.k = nn.Linear(input_dim, input_dim)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        q, k = self.q(x), self.k(x)
+        attn_scores = torch.bmm(q, k.transpose(1, 2)) / (D ** 0.5)  # (B, N, N)
+        attn_weights = F.softmax(attn_scores.mean(dim=-1), dim=1)  # (B, N)
+        aggregated = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, D)
+        return aggregated, attn_weights
+
+class MultiHeadAttention(BaseAggregator, nn.Module):
+    """Multi-head self-attention with learnable heads."""
+    def __init__(self, input_dim, hidden_dim, num_heads=4):
+        BaseAggregator.__init__(self)
+        nn.Module.__init__(self)
+        self.q = nn.Linear(input_dim, hidden_dim * num_heads)
+        self.k = nn.Linear(input_dim, hidden_dim * num_heads)
+        self.v = nn.Linear(input_dim, hidden_dim * num_heads)
+        self.out_proj = nn.Linear(hidden_dim * num_heads, hidden_dim)
+
+    def forward(self, x):
+        B, N, D = x.shape
         q, k, v = self.q(x), self.k(x), self.v(x)
+        q, k, v = q.view(B, N, self.num_heads, -1), k.view(B, N, self.num_heads, -1), v.view(B, N, self.num_heads, -1)
 
-        if self.type == "scaled_dot":
-            return F.scaled_dot_product_attention(q, k, v)
+        attn_scores = torch.einsum("bnhd,bmhd->bhnm", q, k) / (D ** 0.5)  # (B, H, N, N)
+        attn_weights = F.softmax(attn_scores.mean(dim=1), dim=1)  # Aggregate heads, (B, N)
+        attn_output = torch.bmm(attn_weights.unsqueeze(1), v.mean(dim=2)).squeeze(1)  # (B, D)
 
-        elif self.type == "additive":
-            N = x.shape[1]
-            q_exp = q.unsqueeze(2).expand(-1, -1, N, -1)
-            k_exp = k.unsqueeze(1).expand(-1, N, -1, -1)
-            energy = F.tanh(self.additive_w(torch.cat([q_exp, k_exp], dim=-1)))
-            attention_weights = F.softmax(self.additive_v(energy), dim=2)
-            return (attention_weights * v.unsqueeze(1)).sum(dim=2)
+        return self.out_proj(attn_output), attn_weights
 
-        elif self.type == "multihead":
-            # Split into multiple heads
-            B, N, _ = x.shape
-            q_heads = self.q_heads(x).view(B, N, self.num_heads, -1)
-            k_heads = self.k_heads(x).view(B, N, self.num_heads, -1)
-            v_heads = self.v_heads(x).view(B, N, self.num_heads, -1)
 
-            attn_scores = torch.einsum("bnhd,bmhd->bhnm", q_heads, k_heads) / (q_heads.shape[-1] ** 0.5)
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_output = torch.einsum("bhnm,bmhd->bnhd", attn_weights, v_heads)
+class SoftmaxWeightedAttention(BaseAggregator, nn.Module):
+    """Uses a learnable vector to compute importance."""
+    def __init__(self, input_dim):
+        BaseAggregator.__init__(self)
+        nn.Module.__init__(self)
+        self.attn_vector = nn.Parameter(torch.randn(1, input_dim))
 
-            attn_output = attn_output.contiguous().view(B, N, -1)
-            return self.output_projection(attn_output)
+    def forward(self, x):
+        attn_scores = torch.matmul(x, self.attn_vector.T).squeeze(-1)  # (B, N)
+        attn_weights = F.softmax(attn_scores, dim=1)  # (B, N)
+        aggregated = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, D)
+        return aggregated, attn_weights
 
-        elif self.type == "softmax_weighted":
-            scores = torch.bmm(q, k.transpose(1, 2)) / (q.shape[-1] ** 0.5)
-            attn_weights = F.softmax(scores, dim=-1)
-            return torch.bmm(attn_weights, v)
 
-        elif self.type == "gated":
-            gate_values = torch.sigmoid(self.gate(q))
-            return gate_values * v
+class GatedAttention(BaseAggregator, nn.Module):
+    """Learnable gating mechanism for attention."""
+    def __init__(self, input_dim):
+        BaseAggregator.__init__(self)
+        nn.Module.__init__(self)
+        self.gate = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        gate_values = torch.sigmoid(self.gate(x)).squeeze(-1)  # (B, N)
+        attn_weights = gate_values / gate_values.sum(dim=1, keepdim=True)  # Normalize
+        aggregated = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, D)
+        return aggregated, attn_weights
+
+
+class AttentionAggregator(nn.Module):
+    """Wrapper to select different attention mechanisms."""
+    def __init__(self, input_dim, hidden_dim, type="additive", num_heads=4):
+        super().__init__()
+        if type == "additive":
+            self.attn = AdditiveAttention(input_dim, hidden_dim)
+        elif type == "scaled_dot":
+            self.attn = ScaledDotProductAttention(input_dim)
+        elif type == "multihead":
+            self.attn = MultiHeadAttention(input_dim, hidden_dim, num_heads)
+        elif type == "softmax_weighted":
+            self.attn = SoftmaxWeightedAttention(input_dim)
+        elif type == "gated":
+            self.attn = GatedAttention(input_dim)
+        else:
+            raise ValueError(f"Unknown attention type: {type}")
+
+    def forward(self, x):
+        return self.attn(x)
+
+
+
+class IndependentActionMapper(SwapActionMapper, nn.Module):
+    def __init__(self,  num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu"):
+        SwapActionMapper.__init__(self)
+        nn.Module.__init__(self)
+
+        layers_add = []
+        layers_remove = []
+
+        match act_fn:
+            case "tanh":
+                self.act_fn = nn.Tanh()
+            case "relu":
+                self.act_fn = nn.ReLU()
+            case "gelu":
+                self.act_fn = nn.GELU()
+            case "leaky_relu":
+                self.act_fn = nn.LeakyReLU()
+            case _:
+                raise ValueError(f"Unknown activation function: {act_fn}")
+
+        layers_add.append(nn.Linear(hidden_dim, hidden_dim if num_layer > 1 else num_locations))
+        layers_remove.append(nn.Linear(hidden_dim, hidden_dim if num_layer > 1 else num_locations))
+
+        for i in range(num_layer - 1):
+            layers_add.append(self.act_fn)
+            layers_remove.append(self.act_fn)
+            layers_add.append(nn.Linear(hidden_dim, hidden_dim))
+            layers_remove.append(nn.Linear(hidden_dim, hidden_dim))
+
+        if num_layer > 1:
+            layers_add.append(self.act_fn)
+            layers_remove.append(self.act_fn)
+            layers_remove.append(nn.Linear(hidden_dim, num_locations))
+            layers_add.append(nn.Linear(hidden_dim, num_locations))
+
+        self.add = nn.Sequential(*layers_add)
+        self.remove = nn.Sequential(*layers_remove)
+
+    def forward(self, x):
+        SwapActionMapper.forward(self, x)
+        add_scores = self.add(x).squeeze(-1)
+        remove_scores = self.remove(x).squeeze(-1)
+        return add_scores, remove_scores
+
+
+class SharedActionMapper(SwapActionMapper, nn.Module):
+    def __init__(self, num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu"):
+        SwapActionMapper.__init__(self, num_locations)
+        nn.Module.__init__(self)
+
+        layers = []
+        match act_fn:
+            case "tanh":
+                self.act_fn = nn.Tanh()
+            case "relu":
+                self.act_fn = nn.ReLU()
+            case "gelu":
+                self.act_fn = nn.GELU()
+            case "leaky_relu":
+                self.act_fn = nn.LeakyReLU()
+            case _:
+                raise ValueError(f"Unknown activation function: {act_fn}")
+
+        layers.append(nn.Linear(hidden_dim, hidden_dim if num_layer > 1 else num_locations))
+        for i in range(num_layer - 1):
+            layers.append(self._get_activation_fn(act_fn))
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+
+        if num_layer > 1:
+            layers.append(self._get_activation_fn(act_fn))
+            layers.append(nn.Linear(hidden_dim, num_locations))
+
+        self.shared = nn.Sequential(*layers)
+
+    def forward(self, x):
+        SwapActionMapper.forward(self, x)
+        shared_output = self.shared(x)
+        add_scores, remove_scores = torch.chunk(self.decision(shared_output), 2, dim=-1)
+        return add_scores, remove_scores
+
+    def _get_activation_fn(self, act_fn: str):
+        match act_fn:
+            case "tanh":
+                return nn.Tanh()
+            case "relu":
+                return nn.ReLU()
+            case "gelu":
+                return nn.GELU()
+            case "leaky_relu":
+                return nn.LeakyReLU()
+            case _:
+                raise ValueError(f"Unknown activation function: {act_fn}")
+
+class InteractiveActionMapper(SwapActionMapper, nn.Module):
+    def __init__(self, num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu",
+                 use_attn: bool = False):
+        SwapActionMapper.__init__(self, num_locations)
+        nn.Module.__init__(self)
+
+        layers = []
+        match act_fn:
+            case "tanh":
+                self.act_fn = nn.Tanh()
+            case "relu":
+                self.act_fn = nn.ReLU()
+            case "gelu":
+                self.act_fn = nn.GELU()
+            case "leaky_relu":
+                self.act_fn = nn.LeakyReLU()
+            case _:
+                raise ValueError(f"Unknown activation function: {act_fn}")
+
+        for i in range(num_layer):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(self.act_fn)
+
+        self.shared = nn.Sequential(*layers)
+        self.remove = nn.Linear(hidden_dim, num_locations)
+        self.action_embedding = nn.Embedding(num_locations, hidden_dim)
+        self.add = nn.Linear(hidden_dim * 2, num_locations)
+
+        self.use_attn = use_attn
+        self.attention_weight_layer = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x):
+        SwapActionMapper.forward(self, x)
+        shared_output = self.shared(x)
+        remove_scores = self.remove(shared_output)
+
+        remove_action_one_hot = F.gumbel_softmax(remove_scores, tau=1.0, hard=True)
+        remove_action = remove_action_one_hot.argmax(dim=-1)
+
+        # Use learned embedding instead of one-hot encoding
+        remove_action_embedding = self.action_embedding(remove_action)
+
+        if self.use_attn:
+            attention_weights = torch.sigmoid(self.attention_weight_layer(shared_output)) #TODO: maybe this should be based on the remove action as well
+            scaled_action_embedding = remove_action_embedding * attention_weights
+            add_scores = self.add(torch.cat([shared_output, scaled_action_embedding], dim=-1))
 
         else:
-            raise ValueError(f"Unknown attention type: {self.type}")
+            add_scores = self.add(torch.cat([shared_output, remove_action_embedding], dim=-1))
+
+        return add_scores, remove_scores
+
+
+class SwapBasedAttentionActionMapper(SwapActionNodeMapper, nn.Module):
+    def __init__(self, num_hidden_layer: int, node_dim: int, num_locations: int, act_fn: str = "gelu"):
+        """
+        Based on https://arxiv.org/pdf/2312.15658
+        Args:
+            num_hidden_layer:
+            node_dim:
+            num_locations:
+            act_fn:
+        """
+        SwapActionNodeMapper.__init__(self, num_locations)
+        nn.Module.__init__(self)
+
+        self.add_mlp = nn.Linear(node_dim, node_dim)
+        self.remove_mlp = nn.Linear(node_dim, node_dim)
+
+        if act_fn == "tanh":
+            self.act_fn = nn.Tanh()
+        elif act_fn == "relu":
+            self.act_fn = nn.ReLU()
+        elif act_fn == "gelu":
+            self.act_fn = nn.GELU()
+        elif act_fn == "leaky_relu":
+            self.act_fn = nn.LeakyReLU()
+
+        linear_layer = []
+        for i in range(num_hidden_layer):
+            linear_layer.append(nn.Linear(node_dim, node_dim))
+            linear_layer.append(self.act_fn)
+        self.project = nn.Sequential(*linear_layer)
+
+
+    def forward(self, x):
+        SwapActionNodeMapper.forward(self, x)
+        g_l2 = self.project(x)
+        remove_scores = self.remove_mlp(g_l2)
+        f = x.T @ F.tanh(self.remove_mlp(x))
+        add_scores = f
+
+        return add_scores, remove_scores
+
+
+
