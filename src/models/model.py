@@ -1,8 +1,4 @@
-import torch.nn as nn
-import torch.nn.functional as F
 import torch
-import torch_geometric.nn as gnn
-from abc import ABC, abstractmethod
 
 from src.models.encoder import *
 from src.models.aggregator import *
@@ -37,11 +33,14 @@ class BaseSwapModel(ABC):
 
 class StandardModel(BaseSwapModel, nn.Module):
     def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
-                 action_layer: int = 1, num_locations: int = 8):
+                 action_layer: int = 1, num_locations: int = 8, num_heads = 2):
         BaseSwapModel.__init__(self)
         nn.Module.__init__(self)
-        self.spatial_encoder = GNNEncoder(input_dim, embedding_dim, hidden_dim, hidden_dim)
-        self.temporal_encoder = LSTMEncoder(hidden_dim, hidden_dim, hidden_dim)
+        self.num_locations = num_locations
+        self.heads = num_heads
+        self.spatial_encoder = GATEncoder(num_layers=4, input_dim=input_dim, embedding_dim=embedding_dim,
+                                          hidden_dim=hidden_dim, output_dim=hidden_dim, heads=2)
+        self.temporal_encoder = LSTMEncoder(hidden_dim * num_heads, hidden_dim, hidden_dim)
         self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
         self.action_mapper = InteractiveActionMapper(action_layer, hidden_dim, num_locations, use_attn=True)
 
@@ -49,12 +48,18 @@ class StandardModel(BaseSwapModel, nn.Module):
         BaseSwapModel.forward(self, x)
         all_embeddings = self.spatial_encoder(x)
 
+        # We discard the client node embeddings as the decision is made only for the locations and the GNN encoder
+        # should compress the client embeddings into the location embeddings with its message passing mechanism
+        # Why? This is much more efficient, as we are now only working with the locations and not the clients in the
+        # temporal dimension, drastically reducing the number of nodes we need to process as num_clients > num_locations
         location_indices = torch.where(x.label != 0)[0]
         #L: Number of locations
         #Shape: B*L*T,D
         location_embeddings = all_embeddings[location_indices]
         # Shape B,T,L,D: Batch, Temporal, Locations, Embedding
         temporal_location_embeddings = location_embeddings.view(len(x) // temporal_size, temporal_size, -1, location_embeddings.size(-1))
+
+        add_mask = x.add_mask[location_indices].view(len(x) // temporal_size, temporal_size, self.num_locations)[:, -1, :]
 
         #Shape: B, L, D as we are aggregating over the temporal dimension using LSTM
         temporal_output = self.temporal_encoder(temporal_location_embeddings)
@@ -63,7 +68,7 @@ class StandardModel(BaseSwapModel, nn.Module):
         aggregated_temporal_node_embeddings, attn_weights = self.aggregator(temporal_output)
 
         #Shape: B, L, 2 as we are mapping the aggregated embeddings to actions
-        add_logits, remove_logits = self.action_mapper(aggregated_temporal_node_embeddings)
+        add_logits, remove_logits = self.action_mapper(aggregated_temporal_node_embeddings, add_mask)
 
         if return_attn:
             return (add_logits, remove_logits), attn_weights

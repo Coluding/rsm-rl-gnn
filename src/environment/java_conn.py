@@ -38,6 +38,7 @@ class JavaSimulator:
         self.jar_path = jar_path
 
         # Fully qualified Java class names
+        # P is for path
         self.FluiditySimulator = "de.optscore.simulator.FluiditySimulator"
         self.FluiditySimulationExecution = "de.optscore.simulation.fluidity.FluiditySimulationExecution"
         self.FluiditySimulationExecutionFactory = "de.optscore.simulation.fluidity.FluiditySimulationExecutionFactory"
@@ -46,11 +47,14 @@ class JavaSimulator:
         self.FluiditySimulation = "de.optscore.simulation.fluidity.FluiditySimulation"
         self.DefaultOptimizationInstructions = "bftsmart.location.management.exploration.DefaultOptimizationInstructions"
         self.ArrayList = "java.util.ArrayList"
-        SwapActiveKeepPassive = "bftsmart.location.management.exploration.instructions.SwapActiveKeepPassive"
-        LocatedNodeIdentifier = "bftsmart.identity.LocatedNodeIdentifier"
-        LocatedNode = "bftsmart/location/LocatedNode"
-        EnsureCoordinator = "bftsmart.location.management.exploration.instructions.EnsureCoordinator"
+        self.SwapActiveKeepPassiveP = "bftsmart.location.management.exploration.instructions.SwapActiveKeepPassive"
+        self.SwapActiveP = "bftsmart.location.management.exploration.instructions.SwapActive"
+        self.LocatedNodeIdentifierP = "bftsmart.identity.LocatedNodeIdentifier"
+        self.LocatedNodeP = "bftsmart/location/LocatedNode"
+        self.EnsureCoordinatorP = "bftsmart.location.management.exploration.instructions.EnsureCoordinator"
 
+        self.configuration_directory_simulator = configuration_directory_simulator
+        self.node_identifier = node_identifier
         self.jvm_options = jvm_options
 
         self.classpath = [self.jar_path]
@@ -59,6 +63,11 @@ class JavaSimulator:
             jpype.startJVM(jpype.getDefaultJVMPath(), *self.jvm_options, classpath=self.classpath)
 
         # Load Java classes
+        self._initialize_objects()
+        self.internal_step = 0
+
+
+    def _initialize_objects(self):
         self.Simulator = jpype.JClass(self.FluiditySimulator)
         self.Simulation = jpype.JClass(self.FluiditySimulation)
         self.ExecutionFactory = jpype.JClass(self.FluiditySimulationExecutionFactory)
@@ -68,21 +77,21 @@ class JavaSimulator:
         self.OptimizationInstructions = jpype.JClass(self.DefaultOptimizationInstructions)
         self.JavaArrayList = jpype.JClass(self.ArrayList)
         self.Paths = jpype.JClass("java.nio.file.Paths")
-        self.SwapActive = jpype.JClass(SwapActiveKeepPassive)
-        self.LocatedNodeIdentifier = jpype.JClass(LocatedNodeIdentifier)
-        self.LocatedNode = jpype.JClass(LocatedNode)
-        self.EnsureCoordinator = jpype.JClass(EnsureCoordinator)
+        self.SwapActiveKeepPassive = jpype.JClass(self.SwapActiveKeepPassiveP)
+        self.SwapActive = jpype.JClass(self.SwapActiveP)
+        self.LocatedNodeIdentifier = jpype.JClass(self.LocatedNodeIdentifierP)
+        self.LocatedNode = jpype.JClass(self.LocatedNodeP)
+        self.EnsureCoordinator = jpype.JClass(self.EnsureCoordinatorP)
 
-        self.config_dir = self.Paths.get(configuration_directory_simulator + "/" + node_identifier)
-        self.node_identifier = node_identifier
+        self.config_dir = self.Paths.get(self.configuration_directory_simulator + "/" + self.node_identifier)
 
-        self.simulator = self.Simulator(configuration_directory_simulator, self.node_identifier)
+        self.simulator = self.Simulator(self.configuration_directory_simulator, self.node_identifier)
         self.config = self.Config(self.config_dir, self.node_identifier)
-        self.simulation = self.Simulation(self.config.getSelf(), self.config.getXmrConfigurationDirectory(), self.config)
+        self.simulation = self.Simulation(self.config.getSelf(), self.config.getXmrConfigurationDirectory(),
+                                          self.config)
         self.execution = self.ExecutionFactory().create(self.config)
-        self.internal_step = 0
-
         self.coordinator = self.simulation.getState().getView().getCoordinator()
+
 
     def step(self, action: Tuple[int, int]) -> FluidityStepResult:
         step_action = self._convert_action(action[0], action[1])
@@ -96,6 +105,17 @@ class JavaSimulator:
         mean_latency = step_result.getState().getAverageCalculation().getAverageLatency()
 
         self.coordinator = step_result.getState().getView().getCoordinator()
+
+        if self.execution.getWorkload().getNumberOfSteps() == (self.internal_step):
+            self.internal_step = 0
+            result = FluidityStepResult(distance_latencies=self._convert_step_result(client_latencies, replica_latencies),
+                                      mean_delay=mean_latency,
+                                      active_locations=active_locations,
+                                      coordinator=self.coordinator.getLocation().identify(),
+                                      passive_locations=passive_locations,
+                                      finished=True)
+            self._initialize_objects()
+            return result
 
         return FluidityStepResult(distance_latencies=self._convert_step_result(client_latencies, replica_latencies),
                                   mean_delay=mean_latency,
@@ -149,7 +169,12 @@ class JavaSimulator:
         replicaIDRemove = all_nodes.get(to_remove)
         locatedAddNode = self.LocatedNode(replicaIDAdd, replicaIDAdd.getLocation())
         locatedRemoveNode = self.LocatedNode(replicaIDRemove, replicaIDRemove.getLocation())
-        swapActive = self.SwapActive(locatedAddNode, locatedRemoveNode)
+
+        if any([x.equals(replicaIDAdd) for x in  self.simulation.getState().getView().getPassiveNodes()]):
+            swapActive = self.SwapActive(locatedAddNode, locatedRemoveNode)
+        else:
+            swapActive = self.SwapActiveKeepPassive(locatedAddNode, locatedRemoveNode)
+
         action_list = self.JavaArrayList()
         action_list.add(swapActive)
 
@@ -170,5 +195,5 @@ if __name__ == "__main__":
 
     )
 
-    conn.step((6, 0))
+    conn.step((4, 0))
     conn.step((0, 6))

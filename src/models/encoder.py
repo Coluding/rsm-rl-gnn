@@ -37,7 +37,6 @@ class GNNEncoder(BaseSpatialEncoder, nn.Module):
         self.conv1 = gnn.GCNConv(embedding_dim, hidden_dim)
         self.conv2 = gnn.GCNConv(hidden_dim, output_dim)
 
-
     def forward(self, data):
         BaseSpatialEncoder.forward(self, data)
         x, edge_index, edge_weight = data.label, data.edge_index, data.weight
@@ -50,6 +49,55 @@ class GNNEncoder(BaseSpatialEncoder, nn.Module):
         x = self.conv1(x, edge_index, edge_weight)
         x = torch.relu(x)
         x = self.conv2(x, edge_index, edge_weight)
+        return x
+
+class GATEncoder(BaseSpatialEncoder, nn.Module):
+    def __init__(self, num_layers: int, input_dim, embedding_dim, hidden_dim, output_dim, heads: int = 4,
+                 act_fn: str = "gelu"):
+        BaseSpatialEncoder.__init__(self,)
+        assert num_layers > 1, "GAT must have at least 2 layers"
+        nn.Module.__init__(self)
+        self.embedding = nn.Embedding(input_dim, embedding_dim)
+
+        layers = nn.ModuleList()
+        for _ in range(num_layers - 1):
+            layers.append(gnn.GATConv(embedding_dim, hidden_dim, heads))
+            layers.append(self._get_act_fn(act_fn))
+            embedding_dim = hidden_dim * heads
+
+        layers.append(gnn.GATConv(embedding_dim, output_dim, heads))
+        layers.append(self._get_act_fn(act_fn))
+
+        self.layers = nn.ModuleList(layers)
+
+    def _get_act_fn(self, act_fn: str):
+            match act_fn:
+                case "tanh":
+                    return nn.Tanh()
+                case "relu":
+                    return nn.ReLU()
+                case "gelu":
+                    return nn.GELU()
+                case "leaky_relu":
+                    return nn.LeakyReLU()
+                case _:
+                    raise ValueError(f"Unknown activation function: {act_fn}")
+
+    def forward(self, data):
+        BaseSpatialEncoder.forward(self, data)
+        x, edge_index, edge_weight = data.label, data.edge_index, data.weight
+        if x.dtype == torch.float32 or x.dtype == torch.float64:
+            x = x.long().to(x.device)
+        edge_weight = edge_weight.float().to(edge_weight.device)
+
+        x = self.embedding(x)
+
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, gnn.GATConv):
+                x = layer(x, edge_index, edge_weight)  # Pass edge index and weights to GATConv
+            else:
+                x = layer(x)
+
         return x
 
 
@@ -163,18 +211,19 @@ if __name__ == "__main__":
     flat_graphs = [graph for batch_graphs in data for graph in batch_graphs]
     batched_data = Batch.from_data_list(flat_graphs)
     out = model(batched_data)
-    gnn = GNNEncoder(5, 12, 16, 16)
-    out = gnn(batched_data)
+    enc = GATEncoder(4, 5, 8, 16, 32, 2)
+    out = enc(batched_data)
     location_indices = torch.where(batched_data.label != 0)[0]
     location_embeddings = out[location_indices]
-    temporal_location_embeddings = location_embeddings.view(len(data), len(obs1), -1, 16)
-    lstm = LSTMEncoder(16, 32, 32)
+    temporal_location_embeddings = location_embeddings.view(len(data), len(obs1), -1, 32 * 2)
+    lstm = LSTMEncoder(32 * 2, 32, 32)
     out = lstm(temporal_location_embeddings)
     agg = AttentionAggregator(input_dim=32, hidden_dim=32)
     node_action_mapper = SwapBasedAttentionActionMapper(2, 32, 8)
     shared_action_mapper = SharedActionMapper(1, 32, 8)
     interactive_action_mapper = InteractiveActionMapper(1, 32, 8, use_attn=True)
     out, weights = agg(out)
-    actions = interactive_action_mapper(out)
+    add_mask = batched_data.add_mask[location_indices].view(2, 3, 8)[:, -1, :]
+    actions = interactive_action_mapper(out, add_mask)
     actions = node_action_mapper(agg)
     print(out)

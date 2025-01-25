@@ -258,6 +258,12 @@ class TorchGraphObservationWrapper(gym.ObservationWrapper):
         torch_graph.label = torch_graph.label.to(torch.long).to(self.device)
         torch_graph.edge_index = torch_graph.edge_index.to(self.device)
 
+        add_mask = torch.tensor([0 if x in self.env.active_locations else -float("inf")
+                                 for x in observation.nodes], dtype=torch.float32)
+
+
+        torch_graph.add_mask = add_mask.to(self.device)
+
         return torch_graph
 
 class StackedObservationWrapper(TorchGraphObservationWrapper):
@@ -268,7 +274,7 @@ class StackedObservationWrapper(TorchGraphObservationWrapper):
 
     def reset(self, **kwargs) -> Union[List[torch_geometric.data.Data], Dict]:
         observation, info = self.env.reset(**kwargs)
-        for _ in range(self.stack_size):
+        for _ in range(self.stack_size): # evtl hier den step ausführen, damit wir nicht immer die gleiche observation haben
             self.observation_buffer.append(observation)
         return list(self.observation_buffer), info
 
@@ -284,7 +290,7 @@ if __name__ == "__main__":
         jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
         configuration_directory_simulator="/home/lukas/flusim/simurun/",
         node_identifier="server0",
-        device="cpu",
+        device="cuda",
         feature_dim_node=1
     )
 
@@ -302,6 +308,6 @@ if __name__ == "__main__":
     logger.info(f"Reward: {reward}")
     obs, reward, done, _, _ = env.step((5, 2))
     logger.info(f"Reward: {reward}")
-    for i in range(35):
+    for i in range(40):
         obs, reward, done, _, _ = env.step((0, 0))
         logger.info(f"Step {i}, Reward: {reward}")

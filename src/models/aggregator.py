@@ -320,13 +320,12 @@ class InteractiveActionMapper(SwapActionMapper, nn.Module):
         self.use_attn = use_attn
         self.attention_weight_layer = nn.Linear(hidden_dim, hidden_dim)
 
-    def forward(self, x):
+    def forward(self, x, add_mask=None):
         SwapActionMapper.forward(self, x)
         shared_output = self.shared(x)
         remove_scores = self.remove(shared_output)
 
-        remove_action_one_hot = F.gumbel_softmax(remove_scores, tau=1.0, hard=True)
-        remove_action = remove_action_one_hot.argmax(dim=-1)
+        remove_action = torch.argmax(remove_scores, dim=-1)
 
         # Use learned embedding instead of one-hot encoding
         remove_action_embedding = self.action_embedding(remove_action)
@@ -338,6 +337,15 @@ class InteractiveActionMapper(SwapActionMapper, nn.Module):
 
         else:
             add_scores = self.add(torch.cat([shared_output, remove_action_embedding], dim=-1))
+
+        if add_mask is not None:
+            add_scores = add_scores + add_mask
+
+            mask = add_mask != -float('inf')
+            remove_mask = torch.full_like(add_mask, -float('inf'))
+            remove_mask[~mask] = 0
+
+            remove_scores = remove_scores + remove_mask
 
         return add_scores, remove_scores
 
