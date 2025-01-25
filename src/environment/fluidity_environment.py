@@ -1,13 +1,13 @@
 import gym
 from gym import Env
 from gym import spaces
-from gym.core import ActType, ObsType
+from gym.core import ActType, ObsType, RenderFrame
 from dataclasses import dataclass
 from torch_geometric.utils.convert import from_networkx
-from enum import Enum
+from collections import deque
 import numpy as np
 import networkx as nx
-from typing import Tuple
+from typing import Tuple, Optional, Union, List
 from java_conn import JavaSimulator, FluidityStepResult
 import torch_geometric
 from typing import Dict
@@ -26,7 +26,7 @@ class FluidityEnvironmentConfig:
     configuration_directory_simulator: str
     node_identifier: str
     device: str
-    feature_dim_node: int
+    feature_dim_node: int = 1
 
 logger = initialize_logger(log_file="fluidity.environment.log")
 
@@ -69,6 +69,34 @@ class FluidityEnvironmentRenderer:
         self.ani = animation.FuncAnimation(self.fig, self.update, interval=1000)  # Update every second
         plt.show()
 
+
+class FilteredActionSamplingWrapper(gym.ActionWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.valid_nodes = self._get_valid_nodes()
+        self.action_space = gym.spaces.MultiDiscrete([len(self.valid_nodes), len(self.valid_nodes)])
+
+    def _get_valid_nodes(self):
+        """ Returns indices of nodes that are neither active nor passive. """
+        return [i for i, loc in self.env.loc_mapping.items()
+                if loc not in self.env.active_locations and loc not in self.env.passive_locations]
+
+    def action(self, action):
+        """ Maps sampled action indices to the actual node indices in the original environment. """
+        mapped_action = [self.valid_nodes[action[0]], self.valid_nodes[action[1]]]
+        return mapped_action
+
+    def sample_valid_action(self):
+        """ Samples a valid action based on filtered nodes. """
+        return np.random.choice(self.valid_nodes, size=2)
+
+    def reset(self, **kwargs):
+        """ Update valid nodes after environment reset. """
+        obs = self.env.reset(**kwargs)
+        self.valid_nodes = self._get_valid_nodes()  # Recompute after reset
+        return obs
+
+
 class FluidityEnvironment(Env):
     def __init__(self, config: FluidityEnvironmentConfig):
         self.config = config
@@ -82,7 +110,7 @@ class FluidityEnvironment(Env):
         self.replica_latencies = None
         self.loc_mapping = None
         self.visited_locations = set()
-        self.location_label_mapping = {0: "Client", 1: "Active", 3: "Inactive", 2: "Passive"}
+        self.location_label_mapping = {0: "Client", 1: "Active", 3: "Inactive", 2: "Passive", 4: "Coordinator"}
         self.label_location_mapping = {v: k for k, v in self.location_label_mapping.items()}
         self.active_locations = set()
         self.latency_history = []
@@ -90,14 +118,16 @@ class FluidityEnvironment(Env):
 
         self._initialize_locations()
 
-        self.action_space = spaces.Discrete(5) #TODO change this
-        self.node_space = spaces.Box(low=0, high=np.inf, shape=(config.feature_dim_node,))
+        self.action_space = spaces.MultiDiscrete([len(self.loc_mapping),
+                                                 len(self.loc_mapping)])
+        self.node_space = spaces.Discrete(len(self.location_label_mapping))
         self.edge_space = spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
 
         self.observation_space = spaces.Graph(node_space=self.node_space, edge_space=self.edge_space)
         self.graph = nx.Graph()
 
     def step(self, action: ActType) -> Tuple[ObsType, float, bool, dict]:
+        logger.info(f"Taking action {action}")
         raw_observation  = self.simulator.step(action)
         processed_observation = self._process_raw_observation(raw_observation)
         observation = self._build_graph_from_observation(processed_observation)
@@ -107,7 +137,7 @@ class FluidityEnvironment(Env):
         return observation, reward, done, {}, {}
 
     def reset(self, **kwargs) -> ObsType:
-        raw_observation = self.simulator.step(0)
+        raw_observation = self.simulator.step((0, 0))
         self._initialize_replica_latencies(raw_observation)
         processed_observation = self._process_raw_observation(raw_observation)
         observation = self._build_graph_from_observation(processed_observation)
@@ -117,6 +147,7 @@ class FluidityEnvironment(Env):
     def _process_raw_observation(self, raw_observation: FluidityStepResult) -> Dict[str, Dict[str, float]]:
         self.active_locations = raw_observation.active_locations
         self.passive_locations = raw_observation.passive_locations
+        self.coordinator = raw_observation.coordinator
         self._update_replica_latencies(raw_observation)
         processed_observation = {}
 
@@ -150,6 +181,8 @@ class FluidityEnvironment(Env):
         return mean_latency
 
     def _get_node_label(self, location: str):
+        if location == self.coordinator:
+            return self.label_location_mapping["Coordinator"]
         if "Client" in location:
             return self.label_location_mapping["Client"]
         elif location in self.active_locations:
@@ -204,7 +237,7 @@ class FluidityEnvironment(Env):
             replica_keys = filter(lambda x: "Client" not in x, raw_observation.distance_latencies[loc].keys())
             replica_active_and_passive_keys = filter(lambda x: x in self.active_locations or x in self.passive_locations, replica_keys)
             logger.info(
-                f"Updated replica latencies for active and passive locations: {str(list(replica_active_and_passive_keys))}") if counter == 0 else None
+                f"Updated replica latencies for active {self.active_locations} and passive location:  {self.passive_locations} ") if counter == 0 else None
             for replica in replica_active_and_passive_keys:
                 self.replica_latencies[loc][replica] = raw_observation.distance_latencies[loc][replica]
             counter += 1
@@ -222,10 +255,26 @@ class TorchGraphObservationWrapper(gym.ObservationWrapper):
         if self.one_hot:
             torch_graph.label = torch.nn.functional.one_hot(torch_graph.label)
 
-        torch_graph.label = torch_graph.label.to(torch.float32).to(self.device)
+        torch_graph.label = torch_graph.label.to(torch.long).to(self.device)
         torch_graph.edge_index = torch_graph.edge_index.to(self.device)
 
         return torch_graph
+
+class StackedObservationWrapper(TorchGraphObservationWrapper):
+    def __init__(self, env, stack_size: int = 3):
+        super().__init__(env)
+        self.stack_size = stack_size
+        self.observation_buffer = deque(maxlen=stack_size)
+
+    def reset(self, **kwargs) -> Union[List[torch_geometric.data.Data], Dict]:
+        observation, info = self.env.reset(**kwargs)
+        for _ in range(self.stack_size):
+            self.observation_buffer.append(observation)
+        return list(self.observation_buffer), info
+
+    def observation(self, observation: torch_geometric.data.Data) -> List[torch_geometric.data.Data]:
+        self.observation_buffer.append(observation)
+        return list(self.observation_buffer)
 
 
 
@@ -236,13 +285,23 @@ if __name__ == "__main__":
         configuration_directory_simulator="/home/lukas/flusim/simurun/",
         node_identifier="server0",
         device="cpu",
-        feature_dim_node=10
+        feature_dim_node=1
     )
 
     env = FluidityEnvironment(config)
-    renderer = FluidityEnvironmentRenderer(env)
-    env = TorchGraphObservationWrapper(env, one_hot=True)
+    env = TorchGraphObservationWrapper(env, one_hot=False)
+    env = StackedObservationWrapper(env, stack_size=3)
     obs = env.reset()
-    for i in range(38):
-        obs, reward, done, _, _ = env.step(0)
+    obs, reward, done, _, _ = env.step((0, 0))
+    logger.info(f"Reward: {reward}")
+    obs, reward, done, _, _ = env.step((6, 0))
+    logger.info(f"Reward: {reward}")
+    obs, reward, done, _, _ = env.step((0, 6))
+    logger.info(f"Reward: {reward}")
+    obs, reward, done, _, _ = env.step((7, 1))
+    logger.info(f"Reward: {reward}")
+    obs, reward, done, _, _ = env.step((5, 2))
+    logger.info(f"Reward: {reward}")
+    for i in range(35):
+        obs, reward, done, _, _ = env.step((0, 0))
         logger.info(f"Step {i}, Reward: {reward}")

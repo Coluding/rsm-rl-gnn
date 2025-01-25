@@ -3,11 +3,13 @@ from typing import List, Union, Any, Dict
 import jpype
 import jpype.imports
 from dataclasses import dataclass
+from typing import Tuple, List, Dict
 
 @dataclass
 class FluidityStepResult:
     distance_latencies: Dict[str, Dict[str, float]]
     mean_delay: float
+    coordinator: str
     active_locations: List[str]
     passive_locations: List[str]
     finished: bool = False
@@ -44,6 +46,10 @@ class JavaSimulator:
         self.FluiditySimulation = "de.optscore.simulation.fluidity.FluiditySimulation"
         self.DefaultOptimizationInstructions = "bftsmart.location.management.exploration.DefaultOptimizationInstructions"
         self.ArrayList = "java.util.ArrayList"
+        SwapActiveKeepPassive = "bftsmart.location.management.exploration.instructions.SwapActiveKeepPassive"
+        LocatedNodeIdentifier = "bftsmart.identity.LocatedNodeIdentifier"
+        LocatedNode = "bftsmart/location/LocatedNode"
+        EnsureCoordinator = "bftsmart.location.management.exploration.instructions.EnsureCoordinator"
 
         self.jvm_options = jvm_options
 
@@ -62,6 +68,10 @@ class JavaSimulator:
         self.OptimizationInstructions = jpype.JClass(self.DefaultOptimizationInstructions)
         self.JavaArrayList = jpype.JClass(self.ArrayList)
         self.Paths = jpype.JClass("java.nio.file.Paths")
+        self.SwapActive = jpype.JClass(SwapActiveKeepPassive)
+        self.LocatedNodeIdentifier = jpype.JClass(LocatedNodeIdentifier)
+        self.LocatedNode = jpype.JClass(LocatedNode)
+        self.EnsureCoordinator = jpype.JClass(EnsureCoordinator)
 
         self.config_dir = self.Paths.get(configuration_directory_simulator + "/" + node_identifier)
         self.node_identifier = node_identifier
@@ -72,10 +82,10 @@ class JavaSimulator:
         self.execution = self.ExecutionFactory().create(self.config)
         self.internal_step = 0
 
+        self.coordinator = self.simulation.getState().getView().getCoordinator()
 
-    def step(self, action: int) -> FluidityStepResult:
-        instruction = self._convert_action(action)
-        step_action = self.StepAction(instruction)
+    def step(self, action: Tuple[int, int]) -> FluidityStepResult:
+        step_action = self._convert_action(action[0], action[1])
         step_result = self.execution.executeStep(step_action)
         client_latencies = step_result.getState().getSystemLatencies().getReplicaClientLatencies()
         replica_latencies = step_result.getState().getSystemLatencies().getReplicaLatencies()
@@ -85,9 +95,12 @@ class JavaSimulator:
         passive_locations = [x.getLocation().identify() for x in step_result.getState().getView().getPassiveView().getNodes()]
         mean_latency = step_result.getState().getAverageCalculation().getAverageLatency()
 
+        self.coordinator = step_result.getState().getView().getCoordinator()
+
         return FluidityStepResult(distance_latencies=self._convert_step_result(client_latencies, replica_latencies),
                                   mean_delay=mean_latency,
                                   active_locations=active_locations,
+                                  coordinator=self.coordinator.getLocation().identify(),
                                   passive_locations=passive_locations,
                                   finished=False)
 
@@ -120,8 +133,33 @@ class JavaSimulator:
         return merge_nested_dicts(final_parse_clients, final_parse_replicas)
 
 
-    def _convert_action(self, action: int):
-        return self.OptimizationInstructions(self.JavaArrayList())
+    def _convert_action(self, add_action: int, remove_action: int):
+        if add_action == remove_action:
+            return self._create_noop()
+        else:
+            return self._create_swap_active(add_action, remove_action)
+
+    def _create_noop(self):
+        return self.StepAction(self.OptimizationInstructions(self.JavaArrayList()))
+
+    def _create_swap_active(self, to_add: int, to_remove: int):
+        all_nodes = self.simulation.getState().getView().getAvailableNodes()
+
+        replicaIDAdd = all_nodes.get(to_add)
+        replicaIDRemove = all_nodes.get(to_remove)
+        locatedAddNode = self.LocatedNode(replicaIDAdd, replicaIDAdd.getLocation())
+        locatedRemoveNode = self.LocatedNode(replicaIDRemove, replicaIDRemove.getLocation())
+        swapActive = self.SwapActive(locatedAddNode, locatedRemoveNode)
+        action_list = self.JavaArrayList()
+        action_list.add(swapActive)
+
+        if (self.coordinator.equals(replicaIDRemove)):
+            coordinator = self.EnsureCoordinator(replicaIDAdd)
+            action_list.add(coordinator)
+
+        fluidity_action = self.StepAction(self.OptimizationInstructions(action_list))
+
+        return fluidity_action
 
 
 if __name__ == "__main__":
@@ -132,5 +170,5 @@ if __name__ == "__main__":
 
     )
 
-    conn.step(1)
-    conn.step(1)
+    conn.step((6, 0))
+    conn.step((0, 6))
