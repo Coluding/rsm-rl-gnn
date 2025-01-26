@@ -5,6 +5,8 @@ import jpype.imports
 from dataclasses import dataclass
 from typing import Tuple, List, Dict
 
+from src.utils import initialize_logger
+
 @dataclass
 class FluidityStepResult:
     distance_latencies: Dict[str, Dict[str, float]]
@@ -30,6 +32,7 @@ def jvm_context(classpath: List[str], jvm_options: List[str] = []):
         if jpype.isJVMStarted():
             jpype.shutdownJVM()
 
+logger = initialize_logger()
 
 class JavaSimulator:
     def __init__(self, jar_path: str, jvm_options: List[str],
@@ -91,6 +94,7 @@ class JavaSimulator:
                                           self.config)
         self.execution = self.ExecutionFactory().create(self.config)
         self.coordinator = self.simulation.getState().getView().getCoordinator()
+        self.passive_nodes = self.simulation.getState().getView().getPassiveNodes()
 
 
     def step(self, action: Tuple[int, int]) -> FluidityStepResult:
@@ -105,6 +109,7 @@ class JavaSimulator:
         mean_latency = step_result.getState().getAverageCalculation().getAverageLatency()
 
         self.coordinator = step_result.getState().getView().getCoordinator()
+        self.passive_nodes = step_result.getState().getView().getPassiveNodes()
 
         if self.execution.getWorkload().getNumberOfSteps() == (self.internal_step):
             self.internal_step = 0
@@ -155,11 +160,12 @@ class JavaSimulator:
 
     def _convert_action(self, add_action: int, remove_action: int):
         if add_action == remove_action:
-            return self._create_noop()
+            logger.debug("Noop")
+            return self.create_noop()
         else:
             return self._create_swap_active(add_action, remove_action)
 
-    def _create_noop(self):
+    def create_noop(self):
         return self.StepAction(self.OptimizationInstructions(self.JavaArrayList()))
 
     def _create_swap_active(self, to_add: int, to_remove: int):
@@ -170,9 +176,13 @@ class JavaSimulator:
         locatedAddNode = self.LocatedNode(replicaIDAdd, replicaIDAdd.getLocation())
         locatedRemoveNode = self.LocatedNode(replicaIDRemove, replicaIDRemove.getLocation())
 
-        if any([x.equals(replicaIDAdd) for x in  self.simulation.getState().getView().getPassiveNodes()]):
+        if any([x.equals(replicaIDAdd) for x in  self.passive_nodes]):
+            logger.debug("Need to swap active and passive")
+            logger.debug(f"SwapActive: {replicaIDAdd} -> {replicaIDRemove}")
             swapActive = self.SwapActive(locatedAddNode, locatedRemoveNode)
         else:
+            logger.debug("Normal swap")
+            logger.debug(f"SwapActiveKeepPassive: {replicaIDAdd} -> {replicaIDRemove}")
             swapActive = self.SwapActiveKeepPassive(locatedAddNode, locatedRemoveNode)
 
         action_list = self.JavaArrayList()

@@ -1,2 +1,2 @@
-from dqn import *
-from replay_buffer import *
+from .dqn import *
+from .replay_buffer import *

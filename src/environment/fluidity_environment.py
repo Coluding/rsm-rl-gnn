@@ -8,15 +8,15 @@ from collections import deque
 import numpy as np
 import networkx as nx
 from typing import Tuple, Optional, Union, List
-from java_conn import JavaSimulator, FluidityStepResult
+from src.environment import JavaSimulator, FluidityStepResult
 import torch_geometric
 from typing import Dict
 import torch
-from torch_geometric.data import Data
+import random
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-from env_logging import initialize_logger
+from src.environment import initialize_logger
 
 
 @dataclass
@@ -27,6 +27,7 @@ class FluidityEnvironmentConfig:
     node_identifier: str
     device: str
     feature_dim_node: int = 1
+    reconfiguration_costs: float = 50
 
 logger = initialize_logger(log_file="fluidity.environment.log")
 
@@ -109,6 +110,7 @@ class FluidityEnvironment(Env):
 
         self.replica_latencies = None
         self.loc_mapping = None
+        self.inv_loc_mapping = None
         self.visited_locations = set()
         self.location_label_mapping = {0: "Client", 1: "Active", 3: "Inactive", 2: "Passive", 4: "Coordinator"}
         self.label_location_mapping = {v: k for k, v in self.location_label_mapping.items()}
@@ -126,15 +128,51 @@ class FluidityEnvironment(Env):
         self.observation_space = spaces.Graph(node_space=self.node_space, edge_space=self.edge_space)
         self.graph = nx.Graph()
 
-    def step(self, action: ActType) -> Tuple[ObsType, float, bool, dict]:
-        logger.info(f"Taking action {action}")
-        raw_observation  = self.simulator.step(action)
-        processed_observation = self._process_raw_observation(raw_observation)
-        observation = self._build_graph_from_observation(processed_observation)
-        reward = self.calculate_reward(processed_observation) + raw_observation.mean_delay
-        done = raw_observation.finished
+    def sample_action(self) -> Tuple[int, int]:
+        # Randomly sample an action from the action space
+        # We also want to have a certain probability for no-op
+        if len(self.active_locations) < 1:
+            return (0, 0)
 
-        return observation, reward, done, {}, {}
+        if np.random.rand() < 0.1:
+            return self.inv_loc_mapping[self.active_locations[0]], self.inv_loc_mapping[self.active_locations[0]]
+
+        add_action = random.choice(list(set(self.loc_mapping.values()) - set(self.active_locations)))
+        remove_action = random.choice(self.active_locations)
+
+        return self.inv_loc_mapping[add_action], self.inv_loc_mapping[remove_action]
+
+
+    def step(self, action: ActType) -> Tuple[ObsType, float, bool, dict]:
+        logger.info(f"Taking action: {action} = ({self.loc_mapping[action[0]]}, {self.loc_mapping[action[1]]})")
+
+        reward = 0
+
+        # We set a base reward of 0. This is the reward for a no-op action. We only add the reconfiguration costs if
+        # the action is not a no-op.
+        if action[0] == action[1]:
+            reward += self.config.reconfiguration_costs
+
+        # What do we do here? We check if the action is valid. A valid action must have an add node from the available
+        # locations and a remove node from the active locations. However, it is possible to encode a no-op action by
+        # setting both add and remove to 0. This is a valid action, but it does not change the state of the environment.
+        # In this case, it does not matter if the add node is in the available locations or not.
+        if ((self.loc_mapping[action[0]] not in self.available_locations or self.loc_mapping[action[1]] not in self.active_locations)
+                and not ((action[0] == action[1]))):
+            raw_observation = self.simulator.step((0, 0))
+            processed_observation = self._process_raw_observation(raw_observation)
+            reward = 5000 # Penalize invalid actions
+
+        else:
+            raw_observation  = self.simulator.step(action)
+            processed_observation = self._process_raw_observation(raw_observation)
+            reward = self.calculate_reward(processed_observation) + raw_observation.mean_delay
+
+
+
+        observation = self._build_graph_from_observation(processed_observation)
+        done = raw_observation.finished
+        return observation, -reward, done, {}, {}
 
     def reset(self, **kwargs) -> ObsType:
         raw_observation = self.simulator.step((0, 0))
@@ -147,6 +185,7 @@ class FluidityEnvironment(Env):
     def _process_raw_observation(self, raw_observation: FluidityStepResult) -> Dict[str, Dict[str, float]]:
         self.active_locations = raw_observation.active_locations
         self.passive_locations = raw_observation.passive_locations
+        self.available_locations = set(self.loc_mapping.values()) - set(self.active_locations)
         self.coordinator = raw_observation.coordinator
         self._update_replica_latencies(raw_observation)
         processed_observation = {}
@@ -196,15 +235,15 @@ class FluidityEnvironment(Env):
         G = nx.Graph()
         for location, clients in processed_observation.items():
             region_label = self._get_node_label(location)
-            G.add_node(location, label=region_label)  # 1 for active, 2 for passive, 3 for inactive. TODO: We also need passive here
+            G.add_node(location, label=region_label, name=self.inv_loc_mapping[location])  # 1 for active, 2 for passive, 3 for inactive. TODO: We also need passive here
             for request_partner, weight in clients.items():
                 if "Client" in request_partner:
                     region_label = 0
-                    G.add_node(request_partner, label=region_label)
+                    G.add_node(request_partner, label=region_label, name=-1)
                 else:
                     if not G.has_node(request_partner):
                         region_label = self._get_node_label(request_partner)
-                        G.add_node(request_partner, label=region_label)
+                        G.add_node(request_partner, label=region_label, name=self.inv_loc_mapping[request_partner])
 
                 G.add_edge(location, request_partner, weight=weight)
 
@@ -219,7 +258,10 @@ class FluidityEnvironment(Env):
         locs = list(filter(lambda x: len(x.split(" ")) > 3, locs))
         loc_mapping = {int(x.split(" ")[-1]): x.split(" ")[0] for x in locs}
 
+        inv_loc_mapping = {v: k for k, v in loc_mapping.items()}
+
         self.loc_mapping = loc_mapping
+        self.inv_loc_mapping = inv_loc_mapping
 
     def _initialize_replica_latencies(self, raw_observation: FluidityStepResult):
         # This will be given by the JavaSimulator in the future
@@ -242,6 +284,8 @@ class FluidityEnvironment(Env):
                 self.replica_latencies[loc][replica] = raw_observation.distance_latencies[loc][replica]
             counter += 1
 
+        logger.info(f"Coordinator: {self.coordinator} = {self.inv_loc_mapping[self.coordinator]}")
+
 
 class TorchGraphObservationWrapper(gym.ObservationWrapper):
     def __init__(self, env, one_hot: bool = False):
@@ -257,6 +301,7 @@ class TorchGraphObservationWrapper(gym.ObservationWrapper):
 
         torch_graph.label = torch_graph.label.to(torch.long).to(self.device)
         torch_graph.edge_index = torch_graph.edge_index.to(self.device)
+        torch_graph.name = torch_graph.name.to(torch.long).to(self.device)
 
         add_mask = torch.tensor([0 if x in self.env.active_locations else -float("inf")
                                  for x in observation.nodes], dtype=torch.float32)
@@ -282,6 +327,24 @@ class StackedObservationWrapper(TorchGraphObservationWrapper):
         self.observation_buffer.append(observation)
         return list(self.observation_buffer)
 
+class StackedBatchObservationWrapper(TorchGraphObservationWrapper):
+    def __init__(self, env, stack_size: int = 3):
+        super().__init__(env)
+        self.stack_size = stack_size
+        self.observation_buffer = deque(maxlen=stack_size)
+
+    def reset(self, **kwargs) -> Union[List[torch_geometric.data.Data], Dict]:
+        observation, info = self.env.reset(**kwargs)
+        for _ in range(self.stack_size): # evtl hier den step ausführen, damit wir nicht immer die gleiche observation haben
+            self.observation_buffer.append(observation)
+        batch = torch_geometric.data.Batch.from_data_list(list(self.observation_buffer))
+        return batch, info
+
+    def observation(self, observation: torch_geometric.data.Data) -> List[torch_geometric.data.Data]:
+        self.observation_buffer.append(observation)
+
+        batch = torch_geometric.data.Batch.from_data_list(list(self.observation_buffer))
+        return batch
 
 
 if __name__ == "__main__":
@@ -298,11 +361,11 @@ if __name__ == "__main__":
     env = TorchGraphObservationWrapper(env, one_hot=False)
     env = StackedObservationWrapper(env, stack_size=3)
     obs = env.reset()
-    obs, reward, done, _, _ = env.step((0, 0))
+    obs, reward, done, _, _ = env.step((4, 0))
     logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((6, 0))
+    obs, reward, done, _, _ = env.step((0, 4))
     logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((0, 6))
+    obs, reward, done, _, _ = env.step((4, 0))
     logger.info(f"Reward: {reward}")
     obs, reward, done, _, _ = env.step((7, 1))
     logger.info(f"Reward: {reward}")

@@ -8,9 +8,11 @@ from collections import deque
 from torch_geometric.data import Data
 import gym
 from dataclasses import dataclass
+from torch_geometric.data import Batch
 
 from src.models.model import BaseSwapModel
 from src.algorithm.replay_buffer import ReplayBuffer
+from src.environment import initialize_logger
 
 @dataclass()
 class DQNAgentConfig:
@@ -26,7 +28,9 @@ class DQNAgentConfig:
     epsilon: float = 1.0
     epsilon_decay: float = 0.995
     epsilon_min: float = 0.1
+    reward_scaling: bool = False
 
+logger = initialize_logger("dqn.log")
 
 class DQNAgent:
     def __init__(self, config: DQNAgentConfig):
@@ -43,7 +47,9 @@ class DQNAgent:
         self.epsilon_decay = config.epsilon_decay
         self.epsilon_min = config.epsilon_min
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.reward_scaling = config.reward_scaling
+
+        self.device = self.env.config.device
         self.policy_net.to(self.device)
         self.target_net.to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -54,11 +60,11 @@ class DQNAgent:
 
     def select_action(self, state):
         if random.random() < self.epsilon:
-            return self.env.action_space.sample()
+            return self.env.sample_action() # TODO change to action space
         with torch.no_grad():
             state = state.to(self.device)
-            add_logits, remove_logits = self.policy_net(state)
-            return torch.argmax(add_logits).item(), torch.argmax(remove_logits).item()
+            add_q_vals, remove_q_vals = self.policy_net(state)
+            return torch.argmax(add_q_vals).item(), torch.argmax(remove_q_vals).item()
 
     def train_step(self):
         if len(self.replay_buffer) < self.batch_size:
@@ -67,18 +73,23 @@ class DQNAgent:
         batch = self.replay_buffer.sample(self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.cat(states).to(self.device)
+        batched_states = Batch.from_data_list(states)
+        batched_next_states = Batch.from_data_list(next_states)
+
         actions = torch.tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states = torch.cat(next_states).to(self.device)
+
+        if self.reward_scaling:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-        add_q_values, remove_q_values = self.policy_net(states)
+        add_q_values, remove_q_values = self.policy_net(batched_states)
         add_q_values = add_q_values.gather(1, actions[:, 0].unsqueeze(1))
         remove_q_values = remove_q_values.gather(1, actions[:, 1].unsqueeze(1))
 
         with torch.no_grad():
-            next_add_q_values, next_remove_q_values = self.target_net(next_states)
+            next_add_q_values, next_remove_q_values = self.target_net(batched_next_states)
             next_add_q_values = next_add_q_values.max(1)[0].detach().unsqueeze(1)
             next_remove_q_values = next_remove_q_values.max(1)[0].detach().unsqueeze(1)
 
@@ -89,6 +100,7 @@ class DQNAgent:
         loss_remove = nn.functional.mse_loss(remove_q_values, target_remove_q_values)
         loss = loss_add + loss_remove
 
+        logger.info(f"Loss: {loss.item()}")
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
@@ -117,4 +129,4 @@ class DQNAgent:
 
             self.update_target(episode)
             self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
-            print(f"Episode {episode}: Total Reward = {total_reward}")
+            logger.info(f"Episode {episode}: Total Reward = {total_reward}")

@@ -47,7 +47,7 @@ class StandardModel(BaseSwapModel, nn.Module):
     def forward(self, x, temporal_size: int = 3, return_attn=False):
         BaseSwapModel.forward(self, x)
         all_embeddings = self.spatial_encoder(x)
-
+        B = len(x.batch.unique()) // temporal_size
         # We discard the client node embeddings as the decision is made only for the locations and the GNN encoder
         # should compress the client embeddings into the location embeddings with its message passing mechanism
         # Why? This is much more efficient, as we are now only working with the locations and not the clients in the
@@ -57,9 +57,10 @@ class StandardModel(BaseSwapModel, nn.Module):
         #Shape: B*L*T,D
         location_embeddings = all_embeddings[location_indices]
         # Shape B,T,L,D: Batch, Temporal, Locations, Embedding
-        temporal_location_embeddings = location_embeddings.view(len(x) // temporal_size, temporal_size, -1, location_embeddings.size(-1))
+        temporal_location_embeddings = location_embeddings.view(B, temporal_size, -1, location_embeddings.size(-1))
 
-        add_mask = x.add_mask[location_indices].view(len(x) // temporal_size, temporal_size, self.num_locations)[:, -1, :]
+        # For DQN not needed
+        #add_mask = x.add_mask[location_indices].view(B, temporal_size, self.num_locations)[:, -1, :]
 
         #Shape: B, L, D as we are aggregating over the temporal dimension using LSTM
         temporal_output = self.temporal_encoder(temporal_location_embeddings)
@@ -68,9 +69,9 @@ class StandardModel(BaseSwapModel, nn.Module):
         aggregated_temporal_node_embeddings, attn_weights = self.aggregator(temporal_output)
 
         #Shape: B, L, 2 as we are mapping the aggregated embeddings to actions
-        add_logits, remove_logits = self.action_mapper(aggregated_temporal_node_embeddings, add_mask)
+        add_q_vals, remove_q_vals = self.action_mapper(aggregated_temporal_node_embeddings,) #add_mask)
 
         if return_attn:
-            return (add_logits, remove_logits), attn_weights
+            return (add_q_vals, remove_q_vals), attn_weights
 
-        return add_logits, remove_logits
+        return add_q_vals, remove_q_vals

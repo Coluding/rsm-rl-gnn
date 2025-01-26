@@ -18,7 +18,7 @@ def train(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int 
 
     env = FluidityEnvironment(config)
     env = TorchGraphObservationWrapper(env, one_hot=False)
-    env = StackedObservationWrapper(env, stack_size=3)
+    env = StackedBatchObservationWrapper(env, stack_size=3)
 
     policy_model = StandardModel(input_dim=5, embedding_dim=type_embedding_dim, hidden_dim=hidden_dim,
                           action_layer=action_layer, num_locations=num_locations, num_heads=num_heads)
@@ -43,7 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_heads", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--buffer_size", type=int, default=10000)
     parser.add_argument("--target_update", type=int, default=10)
     parser.add_argument("--priority", type=bool, default=False)

@@ -294,7 +294,7 @@ class InteractiveActionMapper(SwapActionMapper, nn.Module):
                  use_attn: bool = False):
         SwapActionMapper.__init__(self, num_locations)
         nn.Module.__init__(self)
-
+        #TODO: How do we model a no-op: add and remove the same node? But with masking we can't do that in the current setting
         layers = []
         match act_fn:
             case "tanh":
