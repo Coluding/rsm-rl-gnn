@@ -10,6 +10,7 @@ from src.utils import initialize_logger
 @dataclass
 class FluidityStepResult:
     distance_latencies: Dict[str, Dict[str, float]]
+    request_quantity: Dict[str, float]
     mean_delay: float
     coordinator: str
     active_locations: List[str]
@@ -111,10 +112,13 @@ class JavaSimulator:
         self.coordinator = step_result.getState().getView().getCoordinator()
         self.passive_nodes = step_result.getState().getView().getPassiveNodes()
 
+        distance_latencies, request_quantity = self._convert_step_result(client_latencies, replica_latencies,
+                                                                         step_result.getState().getSystemLatencies().getRequestCounts())
         if self.execution.getWorkload().getNumberOfSteps() == (self.internal_step):
             self.internal_step = 0
-            result = FluidityStepResult(distance_latencies=self._convert_step_result(client_latencies, replica_latencies),
+            result = FluidityStepResult(distance_latencies=distance_latencies,
                                       mean_delay=mean_latency,
+                                      request_quantity=request_quantity,
                                       active_locations=active_locations,
                                       coordinator=self.coordinator.getLocation().identify(),
                                       passive_locations=passive_locations,
@@ -122,14 +126,17 @@ class JavaSimulator:
             self._initialize_objects()
             return result
 
-        return FluidityStepResult(distance_latencies=self._convert_step_result(client_latencies, replica_latencies),
+        return FluidityStepResult(distance_latencies=distance_latencies,
                                   mean_delay=mean_latency,
+                                  request_quantity=request_quantity,
                                   active_locations=active_locations,
                                   coordinator=self.coordinator.getLocation().identify(),
                                   passive_locations=passive_locations,
                                   finished=False)
 
-    def _convert_step_result(self, client_latencies, replica_latencies):
+    def _convert_step_result(self, client_latencies, replica_latencies, request_count):
+        client_nodes = [x for x in request_count.getNodes()]
+        client_request_quant = {x.identify() : request_count.getCount(x) for x in client_nodes}
         parsed_client_lats = {entry.getKey().getLocation().identify(): entry.getValue() for entry in client_latencies.entrySet()}
         parsed_replica_lats = {entry.getKey().getLocation().identify(): entry.getValue() for entry in replica_latencies.entrySet()}
         final_parse_clients = {}
@@ -155,7 +162,7 @@ class JavaSimulator:
                     merged[key] = dict2[key]
             return merged
 
-        return merge_nested_dicts(final_parse_clients, final_parse_replicas)
+        return merge_nested_dicts(final_parse_clients, final_parse_replicas), client_request_quant
 
 
     def _convert_action(self, add_action: int, remove_action: int):

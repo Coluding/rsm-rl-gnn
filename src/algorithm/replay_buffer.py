@@ -9,7 +9,7 @@ from torch_geometric.data import Data
 import gym
 
 
-class ReplayBuffer:
+class OffPolicyReplayBuffer:
     def __init__(self, capacity, priority=False):
         self.buffer = deque(maxlen=capacity)
         self.priority = priority
@@ -33,6 +33,22 @@ class ReplayBuffer:
         if self.priority:
             for idx, priority in zip(indices, new_priorities):
                 self.priorities[idx] = priority
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class OnPolicyReplayBuffer:
+    def __init__(self, capacity, ):
+        self.buffer = deque(maxlen=capacity)
+        self.priorities = deque(maxlen=capacity)
+
+    def push(self, state, action, log_prob, reward, next_state, done):
+        self.buffer.append((state, action, log_prob, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        return batch
 
     def __len__(self):
         return len(self.buffer)

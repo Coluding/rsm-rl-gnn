@@ -118,6 +118,8 @@ class FluidityEnvironment(Env):
         self.latency_history = []
         self.client_quantity = {}
 
+        self.request_quantity = {}
+
         self._initialize_locations()
 
         self.action_space = spaces.MultiDiscrete([len(self.loc_mapping),
@@ -188,6 +190,7 @@ class FluidityEnvironment(Env):
         self.available_locations = set(self.loc_mapping.values()) - set(self.active_locations)
         self.coordinator = raw_observation.coordinator
         self._update_replica_latencies(raw_observation)
+        self.request_quantity = raw_observation.request_quantity
         processed_observation = {}
 
         for loc in raw_observation.distance_latencies.keys():
@@ -235,15 +238,15 @@ class FluidityEnvironment(Env):
         G = nx.Graph()
         for location, clients in processed_observation.items():
             region_label = self._get_node_label(location)
-            G.add_node(location, label=region_label, name=self.inv_loc_mapping[location])  # 1 for active, 2 for passive, 3 for inactive. TODO: We also need passive here
+            G.add_node(location, label=region_label, name=self.inv_loc_mapping[location], request_quantity=0)  # 1 for active, 2 for passive, 3 for inactive. TODO: We also need passive here
             for request_partner, weight in clients.items():
                 if "Client" in request_partner:
                     region_label = 0
-                    G.add_node(request_partner, label=region_label, name=-1)
+                    G.add_node(request_partner, label=region_label, name=-1, request_quantity=self.request_quantity[request_partner])
                 else:
                     if not G.has_node(request_partner):
                         region_label = self._get_node_label(request_partner)
-                        G.add_node(request_partner, label=region_label, name=self.inv_loc_mapping[request_partner])
+                        G.add_node(request_partner, label=region_label, name=self.inv_loc_mapping[request_partner], request_quantity=0)
 
                 G.add_edge(location, request_partner, weight=weight)
 
@@ -300,6 +303,7 @@ class TorchGraphObservationWrapper(gym.ObservationWrapper):
             torch_graph.label = torch.nn.functional.one_hot(torch_graph.label)
 
         torch_graph.label = torch_graph.label.to(torch.long).to(self.device)
+        torch_graph.request_quantity = torch_graph.request_quantity.to(torch.float32).to(self.device)
         torch_graph.edge_index = torch_graph.edge_index.to(self.device)
         torch_graph.name = torch_graph.name.to(torch.long).to(self.device)
 

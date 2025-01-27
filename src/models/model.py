@@ -15,8 +15,8 @@ class BaseSwapModel(ABC):
     @abstractmethod
     def forward(self, x):
         """
-        The model takes in a torch_geometric Data object and outputs logits for each add and remove actions. The input
-        data object should have the following attributes:
+        The model takes in a torch_geometric Data object and outputs logits/Q-values for each add and remove actions.
+        The input data object should have the following attributes:
         - label: The node labels of shape (N)
         - edge_index: The edge indices of shape (2, E)
         - weight: The edge weights of shape (E)
@@ -24,6 +24,32 @@ class BaseSwapModel(ABC):
             x: torch.Tensor: Torch_geometric Data object with the attributes described above
         Returns:
             torch.Tensor: The output tensor of shape (B, 2)
+        """
+        assert hasattr(x, "label"), "Input data must have a 'label' attribute"
+        assert hasattr(x, "edge_index"), "Input data must have a 'edge_index' attribute"
+        assert hasattr(x, "weight"), "Input data must have a 'weight' attribute"
+        self.assert_called = True
+
+class BaseValueModel(ABC):
+    def __init__(self):
+        self.assert_called = False
+        self.spatial_encoder: BaseSpatialEncoder = None
+        self.temporal_encoder: BaseTemporalEncoder = None
+        self.aggregator: BaseAggregator = None
+        self.action_mapper: SwapActionMapper | SwapActionNodeMapper = None
+
+    @abstractmethod
+    def forward(self, x):
+        """
+        The model takes in a torch_geometric Data object and outputs the state value for each add and remove actions.
+        The input data object should have the following attributes:
+        - label: The node labels of shape (N)
+        - edge_index: The edge indices of shape (2, E)
+        - weight: The edge weights of shape (E)
+        Args:
+            x: torch.Tensor: Torch_geometric Data object with the attributes described above
+        Returns:
+            torch.Tensor: The output tensor of shape (B, 1)
         """
         assert hasattr(x, "label"), "Input data must have a 'label' attribute"
         assert hasattr(x, "edge_index"), "Input data must have a 'edge_index' attribute"
@@ -44,7 +70,7 @@ class StandardModel(BaseSwapModel, nn.Module):
         self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
         self.action_mapper = InteractiveActionMapper(action_layer, hidden_dim, num_locations, use_attn=True)
 
-    def forward(self, x, temporal_size: int = 3, return_attn=False):
+    def forward(self, x, temporal_size: int = 4, return_attn=False):
         BaseSwapModel.forward(self, x)
         all_embeddings = self.spatial_encoder(x)
         B = len(x.batch.unique()) // temporal_size
@@ -69,9 +95,51 @@ class StandardModel(BaseSwapModel, nn.Module):
         aggregated_temporal_node_embeddings, attn_weights = self.aggregator(temporal_output)
 
         #Shape: B, L, 2 as we are mapping the aggregated embeddings to actions
-        add_q_vals, remove_q_vals = self.action_mapper(aggregated_temporal_node_embeddings,) #add_mask)
+        add_vals, remove_vals = self.action_mapper(aggregated_temporal_node_embeddings,) #add_mask)
 
         if return_attn:
-            return (add_q_vals, remove_q_vals), attn_weights
+            return (add_vals, remove_vals), attn_weights
 
-        return add_q_vals, remove_q_vals
+        return add_vals, remove_vals
+
+
+class StandardValueModel(BaseValueModel, nn.Module):
+    def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
+                 num_locations: int = 8, num_heads: int = 2):
+        nn.Module.__init__(self)
+        BaseValueModel.__init__(self)
+        self.num_locations = num_locations
+        self.spatial_encoder = GATEncoder(
+            num_layers=4, input_dim=input_dim, embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim, output_dim=hidden_dim, heads=num_heads
+        )
+        self.temporal_encoder = LSTMEncoder(hidden_dim * num_heads, hidden_dim, hidden_dim)
+        self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
+
+        # Single output head for value estimation
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)  # Outputs a single scalar value V(s)
+        )
+
+    def forward(self, x, temporal_size: int = 4):
+        all_embeddings = self.spatial_encoder(x)
+        B = len(x.batch.unique()) // temporal_size
+
+        # Select location embeddings only
+        location_indices = torch.where(x.label != 0)[0]
+        location_embeddings = all_embeddings[location_indices]
+        temporal_location_embeddings = location_embeddings.view(B, temporal_size, -1, location_embeddings.size(-1))
+
+        # Temporal encoding
+        temporal_output = self.temporal_encoder(temporal_location_embeddings)
+
+        # Aggregate over locations
+        aggregated_temporal_node_embeddings, _ = self.aggregator(temporal_output)
+
+        # Predict state value V(s)
+        # Shape: B, 1
+        state_value = self.value_head(aggregated_temporal_node_embeddings)
+
+        return state_value.squeeze(-1)

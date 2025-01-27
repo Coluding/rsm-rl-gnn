@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from torch_geometric.data import Batch
 
 from src.models.model import BaseSwapModel
-from src.algorithm.replay_buffer import ReplayBuffer
+from src.algorithm.replay_buffer import OffPolicyReplayBuffer
 from src.environment import initialize_logger
 
 @dataclass()
@@ -116,12 +116,12 @@ class DQNAgent:
             state = state.to(self.device)
             total_reward = 0
             done = False
-
+            steps = 0
             while not done:
                 action = self.select_action(state)
                 next_state, reward, done, _, _ = self.env.step(action)
                 next_state = next_state.to(self.device)
-
+                steps += 1
                 self.replay_buffer.push(state, action, reward, next_state, done)
                 state = next_state
                 total_reward += reward
@@ -129,4 +129,6 @@ class DQNAgent:
 
             self.update_target(episode)
             self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
-            logger.info(f"Episode {episode}: Total Reward = {total_reward}")
+            logger.info(f"Episode {episode}: Average Reward = {total_reward / steps: .4f}")
+            logger.info(f"Epsilon: {self.epsilon}")
+            logger.info(f"Buffer Size: {len(self.replay_buffer)}")

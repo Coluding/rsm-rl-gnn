@@ -46,6 +46,9 @@ class GNNEncoder(BaseSpatialEncoder, nn.Module):
         edge_weight = edge_weight.float().to(edge_weight.device)
 
         x = self.embedding(x)
+        data.request_quantity = (data.request_quantity - data.request_quantity.mean()) / (
+                    data.request_quantity.std() + 1e-6)
+        x = torch.cat([x, data.request_quantity.unsqueeze(1)], dim=-1)
         x = self.conv1(x, edge_index, edge_weight)
         x = torch.relu(x)
         x = self.conv2(x, edge_index, edge_weight)
@@ -60,8 +63,8 @@ class GATEncoder(BaseSpatialEncoder, nn.Module):
         self.embedding = nn.Embedding(input_dim, embedding_dim)
 
         layers = nn.ModuleList()
-        for _ in range(num_layers - 1):
-            layers.append(gnn.GATConv(embedding_dim, hidden_dim, heads))
+        for i in range(num_layers - 1):
+            layers.append(gnn.GATConv(embedding_dim + 1 if i == 0 else 0, hidden_dim, heads))
             layers.append(self._get_act_fn(act_fn))
             embedding_dim = hidden_dim * heads
 
@@ -92,6 +95,10 @@ class GATEncoder(BaseSpatialEncoder, nn.Module):
 
         x = self.embedding(x)
 
+        #  the request quantity
+        data.request_quantity = (data.request_quantity - data.request_quantity.mean()) / (data.request_quantity.std() + 1e-6)
+
+        x = torch.cat([x, data.request_quantity.unsqueeze(1)], dim=-1)
         for i, layer in enumerate(self.layers):
             if isinstance(layer, gnn.GATConv):
                 x = layer(x, edge_index, edge_weight)  # Pass edge index and weights to GATConv

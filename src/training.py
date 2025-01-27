@@ -3,10 +3,10 @@ from environment import *
 from models import *
 import argparse
 
-def train(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int = 1, num_locations: int = 8,
+def dqn(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int = 1, num_locations: int = 8,
           num_heads: int = 2, lr: float = 1e-3, gamma: float = 0.99, batch_size: int = 32, buffer_size: int = 10000,
           target_update: int = 10, priority: bool = False, epsilon: float = 1.0, epsilon_decay: float = 0.995,
-          epsilon_min: float = 0.1):
+          epsilon_min: float = 0.1, stack_states: int = 4):
     config = FluidityEnvironmentConfig(
         jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
         jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
@@ -18,7 +18,7 @@ def train(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int 
 
     env = FluidityEnvironment(config)
     env = TorchGraphObservationWrapper(env, one_hot=False)
-    env = StackedBatchObservationWrapper(env, stack_size=3)
+    env = StackedBatchObservationWrapper(env, stack_size=stack_states)
 
     policy_model = StandardModel(input_dim=5, embedding_dim=type_embedding_dim, hidden_dim=hidden_dim,
                           action_layer=action_layer, num_locations=num_locations, num_heads=num_heads)
@@ -33,15 +33,49 @@ def train(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int 
     agent = DQNAgent(agent_config)
     agent.train()
 
+def ppo(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int = 1, num_locations: int = 8,
+       num_heads: int = 2, lr: float = 1e-3, gamma: float = 0.99, batch_size: int = 32, buffer_size: int = 10000,
+       clip_epsilon: float = 0.2, entropy_coeff: float = 0.01, value_coeff: float = 0.5, update_epochs: int = 10,
+        reward_scaling: bool = False, train_every: int = 50, stack_states: int = 4):
+
+    config = FluidityEnvironmentConfig(
+        jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
+        jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
+        configuration_directory_simulator="/home/lukas/flusim/simurun/",
+        node_identifier="server0",
+        device="cuda",
+        feature_dim_node=1,
+    )
+
+    env = FluidityEnvironment(config)
+
+    env = TorchGraphObservationWrapper(env, one_hot=False)
+    env = StackedBatchObservationWrapper(env, stack_size=stack_states)
+
+    policy_model = StandardModel(input_dim=5, embedding_dim=type_embedding_dim, hidden_dim=hidden_dim,
+                            action_layer=action_layer, num_locations=num_locations, num_heads=num_heads)
+
+    value_model = StandardValueModel(input_dim=5, embedding_dim=type_embedding_dim, hidden_dim=hidden_dim,
+                                     num_locations=num_locations, num_heads=num_heads, )
+
+    agent_config = PPOAgentConfig(policy_net=policy_model, value_net=value_model, env=env, lr=lr, gamma=gamma,
+                                  batch_size=batch_size, buffer_size=buffer_size, clip_epsilon=clip_epsilon,
+                                  entropy_coeff=entropy_coeff, value_coeff=value_coeff, update_epochs=update_epochs,
+                                    reward_scaling=reward_scaling, train_every=train_every, temporal_size=stack_states)
+
+    agent = PPOAgent(agent_config)
+    agent.train()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--type_embedding_dim", type=int, default=12)
+    parser.add_argument("--algorithm", type=str, default="dqn", choices=["dqn", "ppo"])
+    parser.add_argument("--type_embedding_dim", type=int, default=8)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--action_layer", type=int, default=1)
     parser.add_argument("--num_locations", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--buffer_size", type=int, default=10000)
@@ -50,10 +84,24 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=float, default=1.0)
     parser.add_argument("--epsilon_decay", type=float, default=0.995)
     parser.add_argument("--epsilon_min", type=float, default=0.1)
+    parser.add_argument("--clip_epsilon", type=float, default=0.2)
+    parser.add_argument("--entropy_coeff", type=float, default=0.01)
+    parser.add_argument("--value_coeff", type=float, default=0.5)
+    parser.add_argument("--update_epochs", type=int, default=10)
+    parser.add_argument("--reward_scaling", type=bool, default=False)
+    parser.add_argument("--train_every", type=int, default=50)
+    parser.add_argument("--stack_states", type=int, default=4)
     args = parser.parse_args()
-    train(args.type_embedding_dim, args.hidden_dim, args.action_layer, args.num_locations, args.num_heads, args.lr,
+
+    if args.algorithm == "dqn":
+        dqn(args.type_embedding_dim, args.hidden_dim, args.action_layer, args.num_locations, args.num_heads, args.lr,
           args.gamma, args.batch_size, args.buffer_size, args.target_update, args.priority, args.epsilon,
           args.epsilon_decay, args.epsilon_min)
+
+    elif args.algorithm == "ppo":
+        ppo(args.type_embedding_dim, args.hidden_dim, args.action_layer, args.num_locations, args.num_heads, args.lr,
+          args.gamma, args.batch_size, args.buffer_size, args.clip_epsilon, args.entropy_coeff, args.value_coeff,
+          args.update_epochs, args.reward_scaling, args.train_every)
 
 
 
