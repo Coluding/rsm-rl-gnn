@@ -184,12 +184,12 @@ class JavaSimulator:
         locatedRemoveNode = self.LocatedNode(replicaIDRemove, replicaIDRemove.getLocation())
 
         if any([x.equals(replicaIDAdd) for x in  self.passive_nodes]):
-            logger.debug("Need to swap active and passive")
-            logger.debug(f"SwapActive: {replicaIDAdd} -> {replicaIDRemove}")
+            #logger.debug("Need to swap active and passive")
+            #logger.debug(f"SwapActive: {replicaIDAdd} -> {replicaIDRemove}")
             swapActive = self.SwapActive(locatedAddNode, locatedRemoveNode)
         else:
-            logger.debug("Normal swap")
-            logger.debug(f"SwapActiveKeepPassive: {replicaIDAdd} -> {replicaIDRemove}")
+            #logger.debug("Normal swap")
+            #logger.debug(f"SwapActiveKeepPassive: {replicaIDAdd} -> {replicaIDRemove}")
             swapActive = self.SwapActiveKeepPassive(locatedAddNode, locatedRemoveNode)
 
         action_list = self.JavaArrayList()

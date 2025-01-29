@@ -69,7 +69,7 @@ class MeanAggregator(BaseAggregator, nn.Module):
 
     def forward(self, x):
         BaseAggregator.forward(self, x)
-        return torch.mean(x, dim=1)
+        return torch.mean(x, dim=-2)
 
 class MaxAggregator(BaseAggregator, nn.Module):
     def __init__(self):
@@ -100,11 +100,15 @@ class AdditiveAttention(BaseAggregator, nn.Module):
         self.v = nn.Linear(hidden_dim, 1)  # Score projection
 
     def forward(self, x):
-        B, N, D = x.shape
+        #B, N, D = x.shape
         energy = torch.tanh(self.W(x))  # (B, N, hidden_dim)
         attn_scores = self.v(energy).squeeze(-1)  # (B, N)
-        attn_weights = F.softmax(attn_scores, dim=1)  # Normalize
-        aggregated = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, D)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # Normalize
+
+        if len(x.shape) == 4:
+            aggregated = torch.einsum("abc,abcd->abd", attn_weights, x)
+        else:
+            aggregated = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, D)
         return aggregated, attn_weights
 
 

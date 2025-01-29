@@ -9,6 +9,7 @@ from torch_geometric.data import Data
 import gym
 from dataclasses import dataclass
 from torch_geometric.data import Batch
+from torch.utils.tensorboard import SummaryWriter
 
 from src.models.model import BaseSwapModel
 from src.algorithm.replay_buffer import OffPolicyReplayBuffer
@@ -29,6 +30,7 @@ class DQNAgentConfig:
     epsilon_decay: float = 0.995
     epsilon_min: float = 0.1
     reward_scaling: bool = False
+    eval_every_episode: int = 10
 
 logger = initialize_logger("dqn.log")
 
@@ -53,13 +55,18 @@ class DQNAgent:
         self.policy_net.to(self.device)
         self.target_net.to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net = self.target_net.to(self.device)
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-        self.replay_buffer = ReplayBuffer(self.buffer_size, self.priority)
+        self.replay_buffer = OffPolicyReplayBuffer(self.buffer_size, self.priority)
 
-    def select_action(self, state):
-        if random.random() < self.epsilon:
+        self.writer = SummaryWriter()
+        self.steps = 0
+        self.eval_every = config.eval_every_episode
+
+    def select_action(self, state, deterministic=False):
+        if random.random() < self.epsilon and not deterministic:
             return self.env.sample_action() # TODO change to action space
         with torch.no_grad():
             state = state.to(self.device)
@@ -73,8 +80,8 @@ class DQNAgent:
         batch = self.replay_buffer.sample(self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        batched_states = Batch.from_data_list(states)
-        batched_next_states = Batch.from_data_list(next_states)
+        batched_states = Batch.from_data_list(states).to(self.device)
+        batched_next_states = Batch.from_data_list(next_states).to(self.device)
 
         actions = torch.tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
@@ -101,16 +108,21 @@ class DQNAgent:
         loss = loss_add + loss_remove
 
         logger.info(f"Loss: {loss.item()}")
+        logger.info(f"Q values example: {add_q_values[0].tolist()} {remove_q_values[0].tolist()}")
+        logger.info(f"Corresponding rewards {rewards.tolist()}")
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
+
+        self.writer.add_scalar("Loss", loss.item())
 
     def update_target(self, episode):
         if episode % self.target_update == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def train(self, num_episodes=500):
+        rewards = []
         for episode in range(num_episodes):
             state, _ = self.env.reset()
             state = state.to(self.device)
@@ -122,13 +134,39 @@ class DQNAgent:
                 next_state, reward, done, _, _ = self.env.step(action)
                 next_state = next_state.to(self.device)
                 steps += 1
+                self.steps += 1
                 self.replay_buffer.push(state, action, reward, next_state, done)
                 state = next_state
                 total_reward += reward
                 self.train_step()
+                rewards.append(reward)
+
+            if episode % self.eval_every == 0:
+                self.evaluate()
 
             self.update_target(episode)
             self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
             logger.info(f"Episode {episode}: Average Reward = {total_reward / steps: .4f}")
+            logger.info(f"Running average reward: {sum(rewards[-100:]) / 100: .4f}")
             logger.info(f"Epsilon: {self.epsilon}")
             logger.info(f"Buffer Size: {len(self.replay_buffer)}")
+            self.writer.add_scalar("Episode Reward", total_reward / steps)
+            self.writer.add_scalar("Running Average Reward", sum(rewards[-100:]) / 100)
+
+
+    def evaluate(self):
+        state, _ = self.env.reset()
+        state = state.to(self.device)
+        total_reward = 0
+        done = False
+        steps = 0
+        while not done:
+            action = self.select_action(state)
+            next_state, reward, done, _, _ = self.env.step(action)
+            next_state = next_state.to(self.device)
+            steps += 1
+            state = next_state
+            total_reward += reward
+
+        logger.info(f"Average Reward = {total_reward / steps: .4f}")
+        self.writer.add_scalar("Evaluation reward Reward", total_reward / steps)

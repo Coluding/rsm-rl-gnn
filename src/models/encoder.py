@@ -61,10 +61,11 @@ class GATEncoder(BaseSpatialEncoder, nn.Module):
         assert num_layers > 1, "GAT must have at least 2 layers"
         nn.Module.__init__(self)
         self.embedding = nn.Embedding(input_dim, embedding_dim)
+        self.request_embedding = nn.Linear(1, embedding_dim)
 
         layers = nn.ModuleList()
         for i in range(num_layers - 1):
-            layers.append(gnn.GATConv(embedding_dim + 1 if i == 0 else 0, hidden_dim, heads))
+            layers.append(gnn.GATConv(embedding_dim * 2 if i == 0 else 0, hidden_dim, heads))
             layers.append(self._get_act_fn(act_fn))
             embedding_dim = hidden_dim * heads
 
@@ -95,10 +96,12 @@ class GATEncoder(BaseSpatialEncoder, nn.Module):
 
         x = self.embedding(x)
 
-        #  the request quantity
+        #Normalize  the request quantity
         data.request_quantity = (data.request_quantity - data.request_quantity.mean()) / (data.request_quantity.std() + 1e-6)
 
-        x = torch.cat([x, data.request_quantity.unsqueeze(1)], dim=-1)
+        request_embedding = self.request_embedding(data.request_quantity.unsqueeze(1))
+
+        x = torch.cat([x, request_embedding], dim=-1)
         for i, layer in enumerate(self.layers):
             if isinstance(layer, gnn.GATConv):
                 x = layer(x, edge_index, edge_weight)  # Pass edge index and weights to GATConv
@@ -141,96 +144,56 @@ class LSTMEncoder(BaseTemporalEncoder, nn.Module):
         x = self.fc(x[:, -1, :])
         return x.view(B, N, -1)
 
-class Attention(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, type: str = "scaled_dot", num_heads: int = 4):
-
+class GRUEncoder(BaseTemporalEncoder, nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_gru_layers=1):
+        BaseTemporalEncoder.__init__(self, input_dim, hidden_dim, output_dim)
         nn.Module.__init__(self)
-        self.type = type
-        self.num_heads = num_heads
-
-        # Projection layers
-        self.q = nn.Linear(input_dim, hidden_dim)
-        self.k = nn.Linear(input_dim, hidden_dim)
-        self.v = nn.Linear(input_dim, hidden_dim)
-
-        # Additive attention parameters
-        if type == "additive":
-            self.additive_w = nn.Linear(2 * hidden_dim, hidden_dim)
-            self.additive_v = nn.Linear(hidden_dim, 1)
-
-        # Multi-head Attention
-        if type == "multihead":
-            self.q_heads = nn.Linear(input_dim, hidden_dim * num_heads)
-            self.k_heads = nn.Linear(input_dim, hidden_dim * num_heads)
-            self.v_heads = nn.Linear(input_dim, hidden_dim * num_heads)
-            self.output_projection = nn.Linear(hidden_dim * num_heads, hidden_dim)
-
-        if type == "gated":
-            self.gate = nn.Linear(hidden_dim, 1)
+        gru_layers = [nn.GRU(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=False) for _ in range(num_gru_layers)]
+        self.gru = nn.Sequential(*gru_layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        super().forward(x)
-        q, k, v = self.q(x), self.k(x), self.v(x)
+        BaseTemporalEncoder.forward(self, x)
+        B, T, N, D = x.size()
+        x = x.view(B * N, T, D)
+        x, _ = self.gru(x)
+        x = self.fc(x[:, -1, :])
+        return x.view(B, N, -1)
 
-        if self.type == "scaled_dot":
-            return F.scaled_dot_product_attention(q, k, v)
 
-        elif self.type == "additive":
-            N = x.shape[1]
-            q_exp = q.unsqueeze(2).expand(-1, -1, N, -1)
-            k_exp = k.unsqueeze(1).expand(-1, N, -1, -1)
-            energy = F.tanh(self.additive_w(torch.cat([q_exp, k_exp], dim=-1)))
-            attention_weights = F.softmax(self.additive_v(energy), dim=2)
-            return (attention_weights * v.unsqueeze(1)).sum(dim=2)
 
-        elif self.type == "multihead":
-            B, N, _ = x.shape
-            q_heads = self.q_heads(x).view(B, N, self.num_heads, -1)
-            k_heads = self.k_heads(x).view(B, N, self.num_heads, -1)
-            v_heads = self.v_heads(x).view(B, N, self.num_heads, -1)
-
-            attn_scores = torch.einsum("bnhd,bmhd->bhnm", q_heads, k_heads) / (q_heads.shape[-1] ** 0.5)
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_output = torch.einsum("bhnm,bmhd->bnhd", attn_weights, v_heads)
-
-            attn_output = attn_output.contiguous().view(B, N, -1)
-            return self.output_projection(attn_output)
-
-        elif self.type == "softmax_weighted":
-            scores = torch.bmm(q, k.transpose(1, 2)) / (q.shape[-1] ** 0.5)
-            attn_weights = F.softmax(scores, dim=-1)
-            return torch.bmm(attn_weights, v)
-
-        elif self.type == "gated":
-            gate_values = torch.sigmoid(self.gate(q))
-            return gate_values * v
-
-        else:
-            raise ValueError(f"Unknown attention type: {self.type}")
 
 if __name__ == "__main__":
     from aggregator import *
-    from model import StandardModel
-    model = StandardModel(5, 8, 128, 1, 8)
+    from model import StandardModel, RSMDecisionTransformer
+    from src.algorithm.offline import DecisionTransformerGraphDataset
+    from torch.utils.data import DataLoader
+    model = RSMDecisionTransformer(5, 8, 128, 1, 8)
     obs1 = torch.load("../environment/test_data.pt")
     obs2 = torch.load("../environment/test_data2.pt")
-    data = [obs1, obs2]
-    flat_graphs = [graph for batch_graphs in data for graph in batch_graphs]
-    batched_data = Batch.from_data_list(flat_graphs)
-    out = model(batched_data)
-    enc = GATEncoder(4, 5, 8, 16, 32, 2)
-    out = enc(batched_data)
-    location_indices = torch.where(batched_data.label != 0)[0]
-    location_embeddings = out[location_indices]
-    temporal_location_embeddings = location_embeddings.view(len(data), len(obs1), -1, 32 * 2)
-    lstm = LSTMEncoder(32 * 2, 32, 32)
-    out = lstm(temporal_location_embeddings)
-    agg = AttentionAggregator(input_dim=32, hidden_dim=32)
-    node_action_mapper = SwapBasedAttentionActionMapper(2, 32, 8)
-    shared_action_mapper = SharedActionMapper(1, 32, 8)
-    interactive_action_mapper = InteractiveActionMapper(1, 32, 8, use_attn=True)
-    out, weights = agg(out)
-    add_mask = batched_data.add_mask[location_indices].view(2, 3, 8)[:, -1, :]
-    actions = interactive_action_mapper(out, add_mask)
-    actions = node_action_mapper(agg)
-    print(out)
+    data = [[obs1[0].to("cpu"), obs2[0].to("cpu"), obs2[0].to("cpu")], [obs1[0].to("cpu"), obs2[0].to("cpu")]]
+    #flat_graphs = [graph for batch_graphs in data for graph in batch_graphs]
+    batched_data = Batch.from_data_list(data[0])
+    action = torch.tensor([[0, 1],[1,2], [0, 1]], dtype=torch.long)
+    rewards = torch.tensor([[1.0], [2.0], [5.0]], dtype=torch.float32)
+    timesteps = torch.tensor([0, 1, 2], dtype=torch.long)
+    dataset = DecisionTransformerGraphDataset(max_len=4)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    r0 = dataset[0]
+    for _ in range(5):
+        r = dataset.sample_batch(7)
+        #g = Batch.from_data_list(r["graphs"])
+        out = model(r["graphs"], r["actions"], r["returns_to_go"],
+                    r["timesteps"], r["attention_mask"], )
+
+    #enc = GATEncoder(4, 5, 8, 16, 32, 2)
+    #out = enc(batched_data)
+
+

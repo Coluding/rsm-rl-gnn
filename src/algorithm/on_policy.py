@@ -98,25 +98,26 @@ class PPOAgent:
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        batch = self.replay_buffer.sample(self.batch_size)
-        states, actions, old_log_probs, rewards, next_states, dones = zip(*batch)
-
-        batched_states = Batch.from_data_list(states).to(self.device)
-        batched_next_states = Batch.from_data_list(next_states).to(self.device)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-        old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
-
-        if self.reward_scaling:
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
-
-        values = self.value_net(batched_states, self.temporal_size).squeeze()
-        next_values = self.value_net(batched_next_states, self.temporal_size).squeeze()
-        advantages = self.compute_advantage(rewards, values, dones)
-
         iterator = tqdm.tqdm(range(self.update_epochs), desc="Running epoch training...", unit="epoch")
         for _ in iterator:
+            # maybe sample with a seed inside the loop
+            batch = self.replay_buffer.sample(self.batch_size)
+            states, actions, old_log_probs, rewards, next_states, dones = zip(*batch)
+
+            batched_states = Batch.from_data_list(states).to(self.device)
+            batched_next_states = Batch.from_data_list(next_states).to(self.device)
+            actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+            old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+            dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+
+            if self.reward_scaling:
+                rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+
+            values = self.value_net(batched_states, self.temporal_size).squeeze()
+            next_values = self.value_net(batched_next_states, self.temporal_size).squeeze()
+            advantages = self.compute_advantage(rewards, values, dones)
+
             # Should not they be in order?
             add_logits, remove_logits = self.policy_net(batched_states, self.temporal_size)
             add_dist = torch.distributions.Categorical(logits=add_logits)
@@ -151,6 +152,7 @@ class PPOAgent:
             if self.step % 100 == 0:
                 logger.info(f"Policy Loss: {policy_loss.item()}")
                 logger.info(f"Value Loss: {value_loss.item()}")
+                logger.info(f"Example Probabilities: {add_dist.probs.tolist()[0]}, {remove_dist.probs.tolist()[0]}")
 
     def train(self, num_episodes=500):
         iterator = tqdm.tqdm(range(num_episodes), desc="Training PPO...", unit="episode")

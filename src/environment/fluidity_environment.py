@@ -29,7 +29,7 @@ class FluidityEnvironmentConfig:
     feature_dim_node: int = 1
     reconfiguration_costs: float = 50
 
-logger = initialize_logger(log_file="fluidity.environment.log")
+logger = initialize_logger(log_file="fluidity.environment.log", log_level="INFO")
 
 
 
@@ -124,10 +124,12 @@ class FluidityEnvironment(Env):
 
         self.action_space = spaces.MultiDiscrete([len(self.loc_mapping),
                                                  len(self.loc_mapping)])
-        self.node_space = spaces.Discrete(len(self.location_label_mapping))
-        self.edge_space = spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
+        disc_feature = spaces.Discrete(len(self.location_label_mapping))
+        request_feature  = spaces.Box(low=0, high=500_000, shape=(1,), dtype=np.float32)
 
-        self.observation_space = spaces.Graph(node_space=self.node_space, edge_space=self.edge_space)
+        self.edge_features = spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
+
+        self.observation_space = spaces.Graph(node_space=request_feature, edge_space=self.edge_features)
         self.graph = nx.Graph()
 
     def sample_action(self) -> Tuple[int, int]:
@@ -146,7 +148,7 @@ class FluidityEnvironment(Env):
 
 
     def step(self, action: ActType) -> Tuple[ObsType, float, bool, dict]:
-        logger.info(f"Taking action: {action} = ({self.loc_mapping[action[0]]}, {self.loc_mapping[action[1]]})")
+        logger.debug(f"Taking action: {action} = ({self.loc_mapping[action[0]]}, {self.loc_mapping[action[1]]})")
 
         reward = 0
 
@@ -168,9 +170,8 @@ class FluidityEnvironment(Env):
         else:
             raw_observation  = self.simulator.step(action)
             processed_observation = self._process_raw_observation(raw_observation)
-            reward = self.calculate_reward(processed_observation) + raw_observation.mean_delay
-
-
+            #reward = self.calculate_reward(processed_observation) + raw_observation.mean_delay #TODO: Check whether we actually need this
+            reward = raw_observation.mean_delay
 
         observation = self._build_graph_from_observation(processed_observation)
         done = raw_observation.finished
@@ -281,13 +282,13 @@ class FluidityEnvironment(Env):
         for loc in self.loc_mapping.values():
             replica_keys = filter(lambda x: "Client" not in x, raw_observation.distance_latencies[loc].keys())
             replica_active_and_passive_keys = filter(lambda x: x in self.active_locations or x in self.passive_locations, replica_keys)
-            logger.info(
+            logger.debug(
                 f"Updated replica latencies for active {self.active_locations} and passive location:  {self.passive_locations} ") if counter == 0 else None
             for replica in replica_active_and_passive_keys:
                 self.replica_latencies[loc][replica] = raw_observation.distance_latencies[loc][replica]
             counter += 1
 
-        logger.info(f"Coordinator: {self.coordinator} = {self.inv_loc_mapping[self.coordinator]}")
+        #logger.debug(f"Coordinator: {self.coordinator} = {self.inv_loc_mapping[self.coordinator]}")
 
 
 class TorchGraphObservationWrapper(gym.ObservationWrapper):
@@ -302,16 +303,16 @@ class TorchGraphObservationWrapper(gym.ObservationWrapper):
         if self.one_hot:
             torch_graph.label = torch.nn.functional.one_hot(torch_graph.label)
 
-        torch_graph.label = torch_graph.label.to(torch.long).to(self.device)
-        torch_graph.request_quantity = torch_graph.request_quantity.to(torch.float32).to(self.device)
-        torch_graph.edge_index = torch_graph.edge_index.to(self.device)
-        torch_graph.name = torch_graph.name.to(torch.long).to(self.device)
+        torch_graph.label = torch_graph.label.to(torch.long)
+        torch_graph.request_quantity = torch_graph.request_quantity.to(torch.float32)
+        torch_graph.edge_index = torch_graph.edge_index
+        torch_graph.name = torch_graph.name.to(torch.long)
 
         add_mask = torch.tensor([0 if x in self.env.active_locations else -float("inf")
                                  for x in observation.nodes], dtype=torch.float32)
 
 
-        torch_graph.add_mask = add_mask.to(self.device)
+        torch_graph.add_mask = add_mask
 
         return torch_graph
 
@@ -371,10 +372,10 @@ if __name__ == "__main__":
     logger.info(f"Reward: {reward}")
     obs, reward, done, _, _ = env.step((4, 0))
     logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((7, 1))
-    logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((5, 2))
+    obs, reward, done, _, _ = env.step((0, 4))
     logger.info(f"Reward: {reward}")
     for i in range(40):
         obs, reward, done, _, _ = env.step((0, 0))
+        if  i == 35:
+            pass
         logger.info(f"Step {i}, Reward: {reward}")
