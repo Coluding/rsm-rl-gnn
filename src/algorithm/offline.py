@@ -11,10 +11,24 @@ from src.models.model import RSMDecisionTransformer
 from src.utils import initialize_logger
 import os
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from dataclasses import dataclass
+
 
 
 logger = initialize_logger("decision_transformer.log")
 
+
+@dataclass
+class TrainingParams:
+    learning_rate: float
+    batch_size: int
+    scheduler: str
+    clip_grad_norm: float = 0
+    scheduler_step_size: int = 0
+    scheduler_gamma: float = 0.1
+    num_epochs: int = 100
+    device: str = "cuda"
 
 class DecisionTransformerGraphDataset(Dataset):
     def __init__(self, max_size=10000, max_len=6, scale=5000.0):
@@ -214,17 +228,18 @@ class DecisionTransformerGraphDataset(Dataset):
 
 
 class DecisionTransformerAgent:
-    def __init__(self, env, model, dataset, batch_size=32, lr=1e-4, device="cuda"):
+    def __init__(self, env = None, model = None, dataset = None, device="cuda"):
         self.env = env
         self.device = device
         self.dataset = dataset
         self.model = model.to(device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.criterion = nn.CrossEntropyLoss()
-        self.batch_size = batch_size
 
     def collect_data(self, num_episodes=100):
         """Collects experience trajectories from the environment."""
+        assert self.env is not None, "Environment not set."
+        assert self.dataset is not None, "Dataset not set."
+
         iterator = tqdm(range(num_episodes), desc="Collecting data...", unit="episode")
         for i in iterator:
             obs, _ = self.env.reset()
@@ -257,34 +272,83 @@ class DecisionTransformerAgent:
         self.dataset = torch.load(file_path)
         logger.info(f"Dataset loaded from {file_path}")
 
-    def train(self, epochs=100):
+    def save_model(self, file_path="model/dt.pt"):
+        """Saves the model to a file."""
+        if not os.path.exists(file_path):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        torch.save(self.model.state_dict(), file_path)
+        logger.info(f"Model saved to {file_path}")
+
+    def load_model(self, file_path="model/dt.pt"):
+        """Loads the model from a file."""
+        self.model.load_state_dict(torch.load(file_path))
+        logger.info(f"Model loaded from {file_path}")
+
+    def train(self, train_params: TrainingParams = None):
         """Trains the Decision Transformer on stored trajectories."""
+        assert self.dataset is not None, "Dataset not set."
+        assert self.model is not None, "Model not set."
+
         self.model.train()
+        summary_writer = SummaryWriter(comment="decision_transformer")
 
-        for epoch in range(epochs):
+        if train_params is None:
+            train_params = TrainingParams(learning_rate=3e-5, batch_size=32, scheduler="none")
+
+        optimizer = optim.AdamW(self.model.parameters(), lr=train_params.learning_rate)
+
+        if train_params.scheduler == "step":
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=train_params.scheduler_step_size,
+                                                  gamma=train_params.scheduler_gamma)
+        elif train_params.scheduler == "none":
+            scheduler = None
+        else:
+            raise ValueError(f"Unknown scheduler: {train_params.scheduler}")
+
+        step = 0
+        iterator = tqdm(range(train_params.num_epochs), desc="Training model...", unit="epoch")
+        best_loss = float("inf")
+        for epoch in iterator:
             epoch_loss = 0
-            batch = self.dataset.sample_batch(self.batch_size)
-            self.optimizer.zero_grad()
+            for _ in range(len(self.dataset)):
+                batch = self.dataset.sample_batch(train_params.batch_size)
+                optimizer.zero_grad()
 
-            # Extract batch elements
-            graphs = batch["graphs"].to(self.device)
-            actions = batch["actions"].to(self.device)
-            returns_to_go = batch["returns_to_go"].to(self.device)
-            timesteps = batch["timesteps"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
+                # Extract batch elements
+                graphs = batch["graphs"].to(self.device)
+                actions = batch["actions"].to(self.device)
+                returns_to_go = batch["returns_to_go"].to(self.device)
+                timesteps = batch["timesteps"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
 
-            pred_actions = self.model(
-                graphs, actions, returns_to_go, timesteps, attention_mask
-            )
+                pred_actions = self.model(
+                    graphs, actions, returns_to_go, timesteps, attention_mask
+                )
 
-            loss1 = self._compute_masked_ce_loss(pred_actions[0], actions[:, :, 0], attention_mask)
-            loss2 = self._compute_masked_ce_loss(pred_actions[1], actions[:, :, 1], attention_mask)
-            loss = loss1 + loss2
-            loss.backward()
-            self.optimizer.step()
-            epoch_loss += loss.item()
+                loss1 = self._compute_masked_ce_loss(pred_actions[0], actions[:, :, 0], attention_mask)
+                loss2 = self._compute_masked_ce_loss(pred_actions[1], actions[:, :, 1], attention_mask)
+                loss = loss1 + loss2
+                loss.backward()
 
-            logger.info(f"Epoch {epoch + 1} Loss: {epoch_loss:.2f}")
+                if train_params.clip_grad_norm > 0:
+                    summary_writer.add_scalar("Gradient Norm", nn.utils.clip_grad_norm_(self.model.parameters(), train_params.clip_grad_norm), epoch)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), train_params.clip_grad_norm)
+
+                optimizer.step()
+                epoch_loss += loss.item()
+                summary_writer.add_scalar("Step Loss", loss.item(), step)
+                step += 1
+
+                if scheduler is not None:
+                    scheduler.step()
+                    summary_writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
+
+                if epoch_loss < best_loss:
+                    best_loss = epoch_loss
+                    self.save_model()
+
+            logger.info(f"Epoch {epoch + 1} Loss: {epoch_loss / len(self.dataset):.2f}")
+            summary_writer.add_scalar("Epoch Loss", epoch_loss / len(self.dataset), epoch)
 
     def _compute_masked_ce_loss(self, pred_action: torch.Tensor, targets: torch.Tensor,
                                 padding_mask: torch.Tensor, reduction: str ="mean"):
@@ -313,6 +377,9 @@ class DecisionTransformerAgent:
 
     def evaluate(self, num_episodes=1):
         """Evaluates the trained model in the environment."""
+        assert self.env is not None, "Environment not set."
+        assert self.model is not None, "Model not set."
+
         self.model.eval()
         total_rewards = []
 
@@ -321,22 +388,40 @@ class DecisionTransformerAgent:
             done = False
             total_reward = 0
 
+            # Initialize sequence storage
+            all_obs = [obs]
+            all_actions = [torch.zeros((1, 2), device=self.device)]  # Dummy initial action
+            all_returns = [torch.tensor([[100.0]], device=self.device)]  # Arbitrary high return
+            all_timesteps = [torch.zeros((1, 1), device=self.device, dtype=torch.long)]
+            all_attention_mask = [torch.ones((1, 1), device=self.device)]
+
             while not done:
                 with torch.no_grad():
-                    graphs = Batch.from_data_list([obs]).to(self.device)
-                    actions = torch.zeros((1, 2), device=self.device)  # Dummy initial action
-                    returns_to_go = torch.zeros((1, 1), device=self.device)
-                    timesteps = torch.zeros((1,), device=self.device, dtype=torch.long)
-                    attention_mask = torch.ones((1,), device=self.device)
+                    graphs = Batch.from_data_list(all_obs).to(self.device)
 
-                    pred_action = self.model(
-                        graphs, actions, returns_to_go, timesteps, attention_mask
-                    )
+                    # Convert lists to tensors
+                    actions = torch.cat(all_actions, dim=0).unsqueeze(0)  # Shape: (1, seq_len, action_dim)
+                    returns_to_go = torch.cat(all_returns, dim=0).unsqueeze(0)  # Shape: (1, seq_len, 1)
+                    timesteps = torch.cat(all_timesteps, dim=-1)  # Shape: (1, seq_len)
+                    attention_mask = torch.cat(all_attention_mask, dim=-1)  # Shape: (1, seq_len)
 
-                add_action = torch.argmax(pred_action[0], dim=-1).item()
-                remove_action = torch.argmax(pred_action[1], dim=-1).item()
-                obs, reward, done, _, _ = self.env.step(tuple(add_action, remove_action))
+                    # Forward pass
+                    pred_action = self.model(graphs, actions, returns_to_go, timesteps, attention_mask)
+
+                # Select actions from prediction
+                add_action = torch.argmax(pred_action[0][:,-1], dim=-1).item()
+                remove_action = torch.argmax(pred_action[0][:,-1], dim=-1).item()
+
+                # Step environment
+                obs, reward, done, _, _ = self.env.step((add_action, remove_action))
                 total_reward += reward
+
+                # Append new observations to sequences
+                all_obs.append(obs)
+                all_actions.append(torch.tensor([[add_action, remove_action]], device=self.device))
+                all_returns.append(torch.tensor([[max(0, all_returns[-1].item() - reward)]], device=self.device))
+                all_timesteps.append(torch.tensor([[len(all_timesteps)]], device=self.device, dtype=torch.long))
+                all_attention_mask.append(torch.ones((1, 1), device=self.device))  # Ensure attention mask stays valid
 
             total_rewards.append(total_reward)
 
@@ -353,7 +438,7 @@ if __name__ == "__main__":
         jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
         configuration_directory_simulator="/home/lukas/flusim/simurun/",
         node_identifier="server0",
-        device="cuda",
+        device="cpu",
         feature_dim_node=1
     )
 
@@ -361,9 +446,14 @@ if __name__ == "__main__":
     env = TorchGraphObservationWrapper(env, one_hot=False)
     model = RSMDecisionTransformer(5, 32, 128, 2, 8)
 
+    train_params = TrainingParams(learning_rate=3e-5, batch_size=4, scheduler="none", num_epochs=1000,
+                                  clip_grad_norm=1.0)
+
     dataset = DecisionTransformerGraphDataset(max_size=10000, max_len=40)
-    agent = DecisionTransformerAgent(env, model, dataset, batch_size=8)
-    agent.collect_data(num_episodes=100)
-    agent.save_dataset(".data/data.pt")
-    #agent.load_dataset(".data/data.pt")
-    #agent.train()
+    agent = DecisionTransformerAgent(env=env, model=model, dataset=dataset, device="cpu")
+    #agent.collect_data(num_episodes=100)
+    #agent.save_dataset(".data/data.pt")
+    agent.load_dataset(".data/data.pt")
+    agent.load_model("model/model_loss_off.pt")
+    agent.evaluate(num_episodes=1)
+    #agent.train(train_params)

@@ -211,13 +211,9 @@ class CustomDecisionTransformerModel(DecisionTransformerPreTrainedModel):
             self,
             states: Optional[torch.FloatTensor] = None,
             actions: Optional[torch.FloatTensor] = None,
-            rewards: Optional[torch.FloatTensor] = None,
             returns_to_go: Optional[torch.FloatTensor] = None,
             timesteps: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.FloatTensor] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
     ) -> Tuple[torch.FloatTensor]:
         batch_size, seq_length = states.shape[0], states.shape[1]
 
@@ -320,9 +316,89 @@ class RSMDecisionTransformer(nn.Module):
                               action_ohe,
                               returns_to_go=return_to_go,
                               timesteps=timesteps,
-                              return_dict=False,
                               attention_mask=attn_mask)
 
         return out
 
 
+class RecurrentDecisionModel(nn.Module):
+    def __init__(self, input_dim: int, node_type_embedding_dim: int, hidden_dim: int,
+                 num_lstm_layers: int = 3, num_locations: int = 8, num_gat_heads: int = 2,
+                 num_actions : int = 2):
+        super().__init__()
+        self.num_locations = num_locations
+        self.hidden_dim = hidden_dim
+        self.num_actions = num_actions
+
+        # Spatial Encoder: GAT
+        self.spatial_encoder = GATEncoder(num_layers=4, input_dim=input_dim, embedding_dim=node_type_embedding_dim,
+                                          hidden_dim=hidden_dim, output_dim=hidden_dim, heads=num_gat_heads)
+
+        self.embed_return = nn.Linear(1, hidden_dim)
+        self.embed_state = nn.Linear(hidden_dim * num_gat_heads, hidden_dim)
+
+        # Separate embedding layers for two actions
+        self.embed_action1 = nn.Linear(num_locations, hidden_dim // 2)
+        self.embed_action2 = nn.Linear(num_locations, hidden_dim // 2)
+
+        self.embed_ln = nn.LayerNorm(hidden_dim)
+
+        self.aggregator = MeanAggregator()
+
+        # Temporal Encoder: GRU
+        self.temporal_encoder = LSTMEncoder(hidden_dim, hidden_dim, hidden_dim, num_lstm_layers)
+
+        if num_actions == 2:
+            self.action_mapper = InteractiveActionMapper(1, hidden_dim, num_locations, use_attn=True)
+        else:
+            self.action_mapper = nn.Linear(hidden_dim, num_locations)
+
+    def forward(self,
+                x: torch_geometric.data.Data,
+                actions: torch.Tensor,
+                returns_to_go: torch.Tensor,
+                timesteps: torch.Tensor, attention_mask: torch.Tensor):
+        B, T = actions.shape[:2]
+
+        all_embeddings = self.spatial_encoder(x)
+
+        # Select location embeddings only
+        location_indices = torch.where(x.label != 0)[0]
+        location_embeddings = all_embeddings[location_indices]
+        location_embeddings = location_embeddings.view(B, T, -1, location_embeddings.size(-1))
+
+        # Apply attention mask to ignore padded inputs
+        location_embeddings = location_embeddings
+
+        graph_embedding = self.aggregator(location_embeddings)
+
+        # ohe action
+        actions[actions == -1] = 0
+        action_ohe = F.one_hot(actions.long(), num_classes=self.num_locations).float()
+
+        state_embeddings = self.embed_state(graph_embedding)
+        returns_embeddings = self.embed_return(returns_to_go)
+        action1_embeddings = self.embed_action1(action_ohe[:, :, 0].float())  # First action
+        action2_embeddings = self.embed_action2(action_ohe[:, :, 1].float())  # Second action
+
+        # Concatenate action embeddings
+        action_embeddings = torch.cat([action1_embeddings, action2_embeddings], dim=-1)
+
+        # Stack input sequence (return, state, action)
+        stacked_inputs = (
+            torch.stack((returns_embeddings, state_embeddings, action_embeddings), dim=1)
+            .permute(0, 2, 1, 3)
+            .reshape(B, 3 * T, self.hidden_dim)
+        )
+        stacked_inputs = self.embed_ln(stacked_inputs)
+
+        # Temporal Encoding with GRU
+        temporal_output = self.temporal_encoder(stacked_inputs)
+
+        # Predict actions
+        action_logits = self.action_mapper(temporal_output)
+
+        # Reshape output into two action heads (add and remove)
+        add_vals, remove_vals = action_logits.view(B, self.num_locations, 2).chunk(2, dim=-1)
+
+        return add_vals.squeeze(-1), remove_vals.squeeze(-1)

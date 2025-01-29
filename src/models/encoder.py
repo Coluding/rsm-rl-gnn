@@ -119,36 +119,56 @@ class BaseTemporalEncoder(ABC):
     def forward(self, x):
         """
         The temporal encoder takes in a sequence of location embeddings (not client embeddings!) and outputs a
-        a temporal embedding for each location in the sequence. The input is expected to be of shape (B, T, N, D)
+        a temporal embedding for each location in the sequence. The input is expected to be of shape (B, T, N, D) or
+        of shape(B, T, D) when we allready aggregated over the locations. The output should be of shape (B, N, D)
         Args:
-            x: torch.Tensor: The input tensor of shape (B, T, N, D)
+            x: torch.Tensor: The input tensor of shape (B, T, N, D) or (B, T, D)
         Returns:
             torch.Tensor: The output tensor of shape (B, N, D)
         """
-        assert len(x.size()) == 4, f"Expected input of shape (B, T, N, D), got {x.size()}"
+        assert len(x.size()) == 4 or len(x.size()) == 3, f"Expected input of shape (B, T, N, D) or (B, T, D) got {x.size()}"
         self.assert_called = True
 
 class LSTMEncoder(BaseTemporalEncoder, nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_lstm_layers=1):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_lstm_layers=1, layer_norm: bool = True):
         BaseTemporalEncoder.__init__(self, input_dim, hidden_dim, output_dim)
         nn.Module.__init__(self)
-        lstm_layers = [nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=False) for _ in range(num_lstm_layers)]
+        lstm_layers = []
+        for i in range(num_lstm_layers):
+            lstm_layers.append(nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=False))
+
+        if layer_norm:
+            self.layer_norm = nn.LayerNorm(hidden_dim)
+
         self.lstm = nn.Sequential(*lstm_layers)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
         BaseTemporalEncoder.forward(self, x)
+        if len(x.shape) == 3:
+            B, T, D = x.size()
+            x, _ = self.lstm(x)
+            x = self.fc(x[:, -1, :])
+            return x
+
         B, T, N, D = x.size()
         x = x.view(B * N, T, D)
         x, _ = self.lstm(x)
+        x = self.layer_norm(x) if hasattr(self, "layer_norm") else x
         x = self.fc(x[:, -1, :])
         return x.view(B, N, -1)
 
 class GRUEncoder(BaseTemporalEncoder, nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_gru_layers=1):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_gru_layers=1, layer_norm: bool = True):
         BaseTemporalEncoder.__init__(self, input_dim, hidden_dim, output_dim)
         nn.Module.__init__(self)
-        gru_layers = [nn.GRU(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=False) for _ in range(num_gru_layers)]
+        gru_layers = []
+        for i in range(num_gru_layers):
+            gru_layers.append(nn.GRU(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=False))
+
+        if layer_norm:
+            self.layer_norm = nn.LayerNorm(hidden_dim)
+
         self.gru = nn.Sequential(*gru_layers)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
@@ -157,38 +177,22 @@ class GRUEncoder(BaseTemporalEncoder, nn.Module):
         B, T, N, D = x.size()
         x = x.view(B * N, T, D)
         x, _ = self.gru(x)
+        x = self.layer_norm(x) if hasattr(self, "layer_norm") else x
         x = self.fc(x[:, -1, :])
         return x.view(B, N, -1)
 
 
-
-
 if __name__ == "__main__":
     from aggregator import *
-    from model import StandardModel, RSMDecisionTransformer
+    from model import StandardModel, RSMDecisionTransformer, RecurrentDecisionModel
     from src.algorithm.offline import DecisionTransformerGraphDataset
     from torch.utils.data import DataLoader
+    #model = RSMDecisionTransformer(5, 8, 128, 1, 8)
     model = RSMDecisionTransformer(5, 8, 128, 1, 8)
-    obs1 = torch.load("../environment/test_data.pt")
-    obs2 = torch.load("../environment/test_data2.pt")
-    data = [[obs1[0].to("cpu"), obs2[0].to("cpu"), obs2[0].to("cpu")], [obs1[0].to("cpu"), obs2[0].to("cpu")]]
-    #flat_graphs = [graph for batch_graphs in data for graph in batch_graphs]
-    batched_data = Batch.from_data_list(data[0])
-    action = torch.tensor([[0, 1],[1,2], [0, 1]], dtype=torch.long)
-    rewards = torch.tensor([[1.0], [2.0], [5.0]], dtype=torch.float32)
-    timesteps = torch.tensor([0, 1, 2], dtype=torch.long)
-    dataset = DecisionTransformerGraphDataset(max_len=4)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
-    dataset.add_trajectory(data[0], action, rewards, timesteps)
+    dataset = torch.load("../algorithm/.data/data.pt")
     r0 = dataset[0]
     for _ in range(5):
-        r = dataset.sample_batch(7)
+        r = dataset.sample_batch(12)
         #g = Batch.from_data_list(r["graphs"])
         out = model(r["graphs"], r["actions"], r["returns_to_go"],
                     r["timesteps"], r["attention_mask"], )

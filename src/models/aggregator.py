@@ -21,7 +21,7 @@ class BaseAggregator(ABC):
         Returns:
             torch.Tensor: The output tensor of shape (B, D)
         """
-        assert len(x.shape) == 3, "Input tensor must have shape (B, N, D)"
+        assert len(x.shape) == 3 or len(x.shape) == 4, "Input tensor must have shape (B, N, D) or (B, T, N, D)"
         self.assert_called = True
 
 class SwapActionMapper(ABC):
