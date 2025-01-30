@@ -1,18 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch_geometric.data
 import torch_geometric.nn as gnn
 import numpy as np
 import random
-from collections import deque
-
+from torch.utils.tensorboard import SummaryWriter
 import tqdm
 from torch_geometric.data import Batch
 import gym
 from dataclasses import dataclass
 
 from src.algorithm import OnPolicyReplayBuffer
-from src.models.model import BaseSwapModel, BaseValueModel
+from src.models.model import BaseSwapModel, BaseValueModel, SwapActionMapper, CrossProductSwapActionMapper
 from src.algorithm.replay_buffer import *
 from src.environment import initialize_logger
 
@@ -34,6 +34,7 @@ class PPOAgentConfig:
     reward_scaling: bool = False
     train_every: int = 50  # Train every n steps
     temporal_size: int = 4
+    cross_product_action_space: CrossProductSwapActionMapper = None
 
 
 torch.autograd.set_detect_anomaly(True)
@@ -57,6 +58,9 @@ class PPOAgent:
         self.update_epochs = config.update_epochs
         self.reward_scaling = config.reward_scaling
         self.train_every = config.train_every
+        self.cross_product_action_space = config.cross_product_action_space
+
+        assert not (self.cross_product_action_space is None and isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper)), "Cross Product Action Space is required for CrossProductSwapActionMapper"
 
         self.device = self.env.config.device
         self.policy_net.to(self.device)
@@ -69,17 +73,29 @@ class PPOAgent:
         self.step = 0
         self.temporal_size = config.temporal_size
 
+        self.writer = SummaryWriter(comment="ppo")
+
     def select_action(self, state):
         state = state.to(self.device)
         with torch.no_grad():
-            add_logits, remove_logits = self.policy_net(state, self.temporal_size)
-            add_dist = torch.distributions.Categorical(logits=add_logits)
-            remove_dist = torch.distributions.Categorical(logits=remove_logits)
-            add_action = add_dist.sample()
-            remove_action = remove_dist.sample()
-            add_log_prob = add_dist.log_prob(add_action)
-            remove_log_prob = remove_dist.log_prob(remove_action)
-        return (add_action.item(), remove_action.item()), (add_log_prob.item(), remove_log_prob.item())
+            if isinstance(self.policy_net.action_mapper, SwapActionMapper):
+                add_logits, remove_logits = self.policy_net(state, self.temporal_size)
+                add_dist = torch.distributions.Categorical(logits=add_logits)
+                remove_dist = torch.distributions.Categorical(logits=remove_logits)
+                add_action = add_dist.sample()
+                remove_action = remove_dist.sample()
+                add_log_prob = add_dist.log_prob(add_action)
+                remove_log_prob = remove_dist.log_prob(remove_action)
+
+                return (add_action.item(), remove_action.item()), (add_log_prob.item(), remove_log_prob.item())
+
+            elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
+                logits = self.policy_net(state, self.temporal_size)
+                dist = torch.distributions.Categorical(logits=logits)
+                action = dist.sample()
+                log_prob = dist.log_prob(action)
+
+                return action.item(), log_prob.item()
 
     def compute_advantage(self, rewards, values, dones):
         advantages = torch.zeros_like(rewards, dtype=torch.float)
@@ -114,11 +130,51 @@ class PPOAgent:
             if self.reward_scaling:
                 rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
 
-            values = self.value_net(batched_states, self.temporal_size).squeeze()
-            next_values = self.value_net(batched_next_states, self.temporal_size).squeeze()
-            advantages = self.compute_advantage(rewards, values, dones)
+            value_loss, advantages = self._value_loss(batched_states, rewards, dones, batched_next_states)
+            policy_loss = self._ppo_loss_logic(batched_states, actions, old_log_probs, advantages)
 
-            # Should not they be in order?
+            total_loss = policy_loss + value_loss
+
+            self.writer.add_scalar("Policy Loss", policy_loss.item(), self.training_step)
+            self.writer.add_scalar("Value Loss", value_loss.item(), self.training_step)
+
+            self.optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
+
+            total_loss.backward()
+
+            # log grad norm
+            self.writer.add_scalar("Policy Grad Norm", nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0), self.training_step)
+            self.writer.add_scalar("Value Grad Norm", nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0), self.training_step)
+
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+
+            self.optimizer.step()
+            self.value_optimizer.step()
+
+            self.training_step += 1
+
+            iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
+            if self.step % 100 == 0:
+                logger.info(f"Policy Loss: {policy_loss.item()}")
+                logger.info(f"Value Loss: {value_loss.item()}")
+
+    def _value_loss(self, batched_states: torch_geometric.data.Data, rewards: torch.Tensor,
+                    dones: torch.Tensor, batched_next_states: torch_geometric.data.Data,
+                    ):
+        values = self.value_net(batched_states, self.temporal_size).squeeze()
+        next_values = self.value_net(batched_next_states, self.temporal_size).squeeze()
+        advantages = self.compute_advantage(rewards, values, dones)
+        value_loss = nn.functional.mse_loss(values, (rewards + self.gamma * next_values * (1 - dones)))
+        value_loss = value_loss * self.value_coeff
+
+        return value_loss, advantages
+
+    def _ppo_loss_logic(self, batched_states: torch_geometric.data.Data, actions: torch.Tensor,
+                         old_log_probs: torch.Tensor, advantages: torch.Tensor,):
+
+        if isinstance(self.policy_net.action_mapper, SwapActionMapper):
             add_logits, remove_logits = self.policy_net(batched_states, self.temporal_size)
             add_dist = torch.distributions.Categorical(logits=add_logits)
             remove_dist = torch.distributions.Categorical(logits=remove_logits)
@@ -134,29 +190,32 @@ class PPOAgent:
             policy_loss = policy_loss - torch.min(ratio_remove * advantages, clipped_ratio_remove * advantages).mean()
             policy_loss = policy_loss - self.entropy_coeff * entropy
 
-            value_loss = nn.functional.mse_loss(values, (rewards + self.gamma * next_values * (1 - dones)))
-            value_loss = value_loss * self.value_coeff
+        elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
+            logits = self.policy_net(batched_states, self.temporal_size)
+            dist = torch.distributions.Categorical(logits=logits)
+            log_probs = dist.log_prob(actions)
+            entropy = dist.entropy().mean()
 
-            self.optimizer.zero_grad()
-            self.value_optimizer.zero_grad()
+            ratio = torch.exp(log_probs - old_log_probs)
+            clipped_ratio = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
+            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+            policy_loss = policy_loss - self.entropy_coeff * entropy
 
-            policy_loss.backward(retain_graph=True)
-            value_loss.backward(retain_graph=True)
-            nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-            nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+        else:
+            raise NotImplementedError(f"Action mapper of type {type(self.policy_net.action_mapper)} not supported")
 
-            self.optimizer.step()
-            self.value_optimizer.step()
-
-            iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
-            if self.step % 100 == 0:
-                logger.info(f"Policy Loss: {policy_loss.item()}")
-                logger.info(f"Value Loss: {value_loss.item()}")
+        if self.step % 100 == 0:
+            if isinstance(self.policy_net.action_mapper, SwapActionMapper):
                 logger.info(f"Example Probabilities: {add_dist.probs.tolist()[0]}, {remove_dist.probs.tolist()[0]}")
+            elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
+                logger.info(f"Example Probabilities: {dist.probs.tolist()[0]}")
+
+        return policy_loss
 
     def train(self, num_episodes=500):
         iterator = tqdm.tqdm(range(num_episodes), desc="Training PPO...", unit="episode")
         all_rewards = []
+        self.training_step = 0
         for episode in iterator:
             state, _ = self.env.reset()
             state = state.to(self.device)
@@ -168,7 +227,14 @@ class PPOAgent:
 
             while not done:
                 action, log_prob = self.select_action(state)
-                next_state, reward, done, _, _ = self.env.step(action)
+
+                if not isinstance(action, tuple):
+                    env_action = self.cross_product_action_space[action]
+
+                else:
+                    env_action = action
+
+                next_state, reward, done, _, _ = self.env.step(env_action)
                 next_state = next_state.to(self.device)
                 steps += 1
                 episode_buffer.append((state, action, log_prob, reward, next_state, done))
@@ -189,3 +255,7 @@ class PPOAgent:
             logger.info(f"Episode {episode}: Steps = {steps}")
             logger.info("Average Reward: {:.4f}".format(np.mean(rewards)))
             logger.info("Rolling Average Reward: {:.4f}".format(np.mean(all_rewards[-100:])))
+
+            self.writer.add_scalar("Episode Reward", total_reward, episode)
+            self.writer.add_scalar("Average Reward", np.mean(rewards), episode)
+            self.writer.add_scalar("Rolling Average Reward", np.mean(all_rewards[-20:]), episode)

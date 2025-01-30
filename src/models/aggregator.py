@@ -43,6 +43,25 @@ class SwapActionMapper(ABC):
         assert len(x.shape) == 2, "Input tensor must have shape (B, D)"
         self.assert_called = True
 
+class CrossProductSwapActionMapper(ABC):
+    def __init__(self, num_locations: int):
+        self.assert_called = False
+        self.num_locations = num_locations
+
+    @abstractmethod
+    def forward(self, x):
+        """
+        The action mapper expects a torch.Tensor as input with the following shape:
+       - (B,D) where B is the batch size, and D is the dimension of the aggregated temporal node embeddings
+
+        Args:
+            x: torch.Tensor: The input tensor of shape (B, D)
+        Returns:
+            torch.Tensor: The output tensor of shape (B, 1)
+        """
+        assert len(x.shape) == 2, "Input tensor must have shape (B, D)"
+        self.assert_called = True
+
 class SwapActionNodeMapper(ABC):
     def __init__(self, num_locations: int):
         self.assert_called = False
@@ -244,7 +263,6 @@ class IndependentActionMapper(SwapActionMapper, nn.Module):
         remove_scores = self.remove(x).squeeze(-1)
         return add_scores, remove_scores
 
-
 class SharedActionMapper(SwapActionMapper, nn.Module):
     def __init__(self, num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu"):
         SwapActionMapper.__init__(self, num_locations)
@@ -300,21 +318,10 @@ class InteractiveActionMapper(SwapActionMapper, nn.Module):
         nn.Module.__init__(self)
         #TODO: How do we model a no-op: add and remove the same node? But with masking we can't do that in the current setting
         layers = []
-        match act_fn:
-            case "tanh":
-                self.act_fn = nn.Tanh()
-            case "relu":
-                self.act_fn = nn.ReLU()
-            case "gelu":
-                self.act_fn = nn.GELU()
-            case "leaky_relu":
-                self.act_fn = nn.LeakyReLU()
-            case _:
-                raise ValueError(f"Unknown activation function: {act_fn}")
 
         for i in range(num_layer):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(self.act_fn)
+            layers.append(self._get_act_fn(act_fn))
 
         self.shared = nn.Sequential(*layers)
         self.remove = nn.Linear(hidden_dim, num_locations)
@@ -323,6 +330,19 @@ class InteractiveActionMapper(SwapActionMapper, nn.Module):
 
         self.use_attn = use_attn
         self.attention_weight_layer = nn.Linear(hidden_dim, hidden_dim)
+
+    def _get_act_fn(self, act_fn: str):
+        match act_fn:
+            case "tanh":
+                return nn.Tanh()
+            case "relu":
+                return nn.ReLU()
+            case "gelu":
+                return nn.GELU()
+            case "leaky_relu":
+                return nn.LeakyReLU()
+            case _:
+                raise ValueError(f"Unknown activation function: {act_fn}")
 
     def forward(self, x, add_mask=None):
         SwapActionMapper.forward(self, x)
@@ -394,6 +414,52 @@ class SwapBasedAttentionActionMapper(SwapActionNodeMapper, nn.Module):
         add_scores = f
 
         return add_scores, remove_scores
+
+
+class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
+    def __init__(self, num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu",
+                 use_attn: bool = False):
+        CrossProductSwapActionMapper.__init__(self, num_locations)
+        nn.Module.__init__(self)
+
+        self.use_attn = use_attn
+
+        layers = []
+        for i in range(num_layer):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(self._get_act_fn(act_fn))
+
+        self.shared = nn.Sequential(*layers)
+        self.add_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
+        self.remove_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
+        self.cross_product_action_mapping = nn.Linear(hidden_dim * 2, num_locations ** 2)
+
+    def _get_act_fn(self, act_fn: str):
+        match act_fn:
+            case "tanh":
+                return nn.Tanh()
+            case "relu":
+                return nn.ReLU()
+            case "gelu":
+                return nn.GELU()
+            case "leaky_relu":
+                return nn.LeakyReLU()
+            case _:
+                raise ValueError(f"Unknown activation function: {act_fn}")
+
+    def forward(self, x,):
+        CrossProductSwapActionMapper.forward(self, x)
+        shared_output = self.shared(x)
+        add_embedding = self.add_head(shared_output)
+        remove_embedding = self.remove_head(shared_output)
+
+        # TODO if self.use_attn:
+
+        actions = self.cross_product_action_mapping(torch.cat([add_embedding, remove_embedding], dim=-1))
+
+        return actions
+
+
 
 
 

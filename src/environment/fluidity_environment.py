@@ -356,7 +356,7 @@ if __name__ == "__main__":
     config = FluidityEnvironmentConfig(
         jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
         jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="/home/lukas/flusim/simurun/",
+        configuration_directory_simulator="/home/lukas/flusim/simrun_4000/",
         node_identifier="server0",
         device="cuda",
         feature_dim_node=1
@@ -374,8 +374,6 @@ if __name__ == "__main__":
     logger.info(f"Reward: {reward}")
     obs, reward, done, _, _ = env.step((0, 4))
     logger.info(f"Reward: {reward}")
-    for i in range(40):
+    for i in range(2000):
         obs, reward, done, _, _ = env.step((0, 0))
-        if  i == 35:
-            pass
         logger.info(f"Step {i}, Reward: {reward}")

@@ -35,6 +35,34 @@ class BaseSwapModel(ABC):
         assert hasattr(x, "weight"), "Input data must have a 'weight' attribute"
         self.assert_called = True
 
+class BaseCrossProductActionSpaceModel(ABC):
+    def __init__(self):
+        self.assert_called = False
+        self.spatial_encoder: BaseSpatialEncoder = None
+        self.temporal_encoder: BaseTemporalEncoder = None
+        self.aggregator: BaseAggregator = None
+        self.action_mapper: SwapActionMapper | SwapActionNodeMapper = None
+
+    @abstractmethod
+    def forward(self, x):
+        """
+        The model takes in a torch_geometric Data object and outputs logits/Q-values for the cross product between
+        add and remove action, i.e. num_locations**2 actions.
+        The input data object should have the following attributes:
+        - label: The node labels of shape (N)
+        - edge_index: The edge indices of shape (2, E)
+        - weight: The edge weights of shape (E)
+        Args:
+            x: torch.Tensor: Torch_geometric Data object with the attributes described above
+        Returns:
+            torch.Tensor: The output tensor of shape (B, 1)
+        """
+        assert hasattr(x, "label"), "Input data must have a 'label' attribute"
+        assert hasattr(x, "edge_index"), "Input data must have a 'edge_index' attribute"
+        assert hasattr(x, "weight"), "Input data must have a 'weight' attribute"
+        self.assert_called = True
+
+
 class BaseValueModel(ABC):
     def __init__(self):
         self.assert_called = False
@@ -106,6 +134,47 @@ class StandardModel(BaseSwapModel, nn.Module):
             return (add_vals, remove_vals), attn_weights
 
         return add_vals, remove_vals
+
+
+class StandardCrossProductModel(BaseCrossProductActionSpaceModel, nn.Module):
+    def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
+                 action_layer: int = 1, num_locations: int = 8, num_heads = 2,
+                 remove_clients: bool = True):
+        BaseCrossProductActionSpaceModel.__init__(self)
+        nn.Module.__init__(self)
+        self.num_locations = num_locations
+        self.heads = num_heads
+        self.remove_clients = remove_clients
+        self.spatial_encoder = GATEncoder(num_layers=4, input_dim=input_dim, embedding_dim=embedding_dim,
+                                          hidden_dim=hidden_dim, output_dim=hidden_dim, heads=2)
+        self.temporal_encoder = GRUEncoder(hidden_dim * num_heads, hidden_dim, hidden_dim)
+        self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
+        self.action_mapper = StandardCrossProductActionMapper(action_layer, hidden_dim, num_locations,)
+
+    def forward(self, x, temporal_size: int = 4, return_attn=False):
+        BaseCrossProductActionSpaceModel.forward(self, x)
+        all_embeddings = self.spatial_encoder(x)
+        B = len(x.batch.unique()) // temporal_size
+
+        if self.remove_clients:
+            location_indices = torch.where(x.label != 0)[0]
+            final_embeddings = all_embeddings[location_indices]
+
+        else:
+            final_embeddings = all_embeddings
+
+        temporal_location_embeddings = final_embeddings.view(B, temporal_size, -1, final_embeddings.size(-1))
+
+        #Shape: B, N, D as we are aggregating over the temporal dimension using LSTM
+        temporal_output = self.temporal_encoder(temporal_location_embeddings)
+
+        #Shape: B, D as we are aggregating over the node dimension using attention
+        aggregated_temporal_node_embeddings, attn_weights = self.aggregator(temporal_output)
+
+        #Shape: B, L, 2 as we are mapping the aggregated embeddings to actions
+        action_values = self.action_mapper(aggregated_temporal_node_embeddings,) #add_mask)
+
+        return action_values
 
 
 class StandardValueModel(BaseValueModel, nn.Module):
@@ -270,7 +339,7 @@ class CustomDecisionTransformerModel(DecisionTransformerPreTrainedModel):
 class RSMDecisionTransformer(nn.Module):
     def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
                  dt_heads: int = 4, num_locations: int = 8, max_ep_len: int = 40,
-                 max_position_embedding: int = 120):
+                 max_position_embedding: int = 400):
 
         super().__init__()
         self.num_locations = num_locations

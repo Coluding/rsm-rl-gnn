@@ -391,17 +391,23 @@ class DecisionTransformerAgent:
             # Initialize sequence storage
             all_obs = [obs]
             all_actions = [torch.zeros((1, 2), device=self.device)]  # Dummy initial action
-            all_returns = [torch.tensor([[100.0]], device=self.device)]  # Arbitrary high return
+            all_returns = []  # Arbitrary high return
             all_timesteps = [torch.zeros((1, 1), device=self.device, dtype=torch.long)]
             all_attention_mask = [torch.ones((1, 1), device=self.device)]
 
             while not done:
-                with torch.no_grad():
+                counter = 0
+                with (torch.no_grad()):
                     graphs = Batch.from_data_list(all_obs).to(self.device)
 
                     # Convert lists to tensors
                     actions = torch.cat(all_actions, dim=0).unsqueeze(0)  # Shape: (1, seq_len, action_dim)
-                    returns_to_go = torch.cat(all_returns, dim=0).unsqueeze(0)  # Shape: (1, seq_len, 1)
+                    if len(all_returns) == 0:
+                        returns_to_go = torch.tensor([[100.]], device=self.device).unsqueeze(0)
+                    else:
+                        returns_to_go = torch.cat((all_returns, torch.tensor(100).unsqueeze(0)), dim=-1).unsqueeze(0).unsqueeze(-1)  # Shape: (1, seq_len, 1)
+                    #all_returns.append(torch.tensor([[100.]], device=self.device))
+                    #returns_to_go = torch.cat(returns_to_go, dim=0).unsqueeze(0)  # Shape: (1, seq_len, 1)
                     timesteps = torch.cat(all_timesteps, dim=-1)  # Shape: (1, seq_len)
                     attention_mask = torch.cat(all_attention_mask, dim=-1)  # Shape: (1, seq_len)
 
@@ -410,7 +416,7 @@ class DecisionTransformerAgent:
 
                 # Select actions from prediction
                 add_action = torch.argmax(pred_action[0][:,-1], dim=-1).item()
-                remove_action = torch.argmax(pred_action[0][:,-1], dim=-1).item()
+                remove_action = torch.argmax(pred_action[1][:,-1], dim=-1).item()
 
                 # Step environment
                 obs, reward, done, _, _ = self.env.step((add_action, remove_action))
@@ -418,10 +424,21 @@ class DecisionTransformerAgent:
 
                 # Append new observations to sequences
                 all_obs.append(obs)
+                total_rewards.append(reward)
+                # cumsum the rewards
+                all_returns = torch.cumsum(torch.tensor(total_rewards), 0)
+                # normalize the returns
+                all_returns = (all_returns - self.dataset.state_mean) / self.dataset.state_std
                 all_actions.append(torch.tensor([[add_action, remove_action]], device=self.device))
-                all_returns.append(torch.tensor([[max(0, all_returns[-1].item() - reward)]], device=self.device))
+                #all_returns.append(torch.tensor([[max(0, all_returns[-1].item() - reward)]], device=self.device))
+                #all_returns.append(torch.tensor([[-10000 + all_returns[-1].item()]], device=self.device))
                 all_timesteps.append(torch.tensor([[len(all_timesteps)]], device=self.device, dtype=torch.long))
                 all_attention_mask.append(torch.ones((1, 1), device=self.device))  # Ensure attention mask stays valid
+
+                if counter % 10 == 0:
+                    logger.info(f"Actions: {add_action}, {remove_action}")
+                counter += 1
+
 
             total_rewards.append(total_reward)
 
@@ -436,7 +453,7 @@ if __name__ == "__main__":
     config = FluidityEnvironmentConfig(
         jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
         jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="/home/lukas/flusim/simurun/",
+        configuration_directory_simulator="/home/lukas/flusim/simrun_4000/",
         node_identifier="server0",
         device="cpu",
         feature_dim_node=1
@@ -444,16 +461,20 @@ if __name__ == "__main__":
 
     env = FluidityEnvironment(config)
     env = TorchGraphObservationWrapper(env, one_hot=False)
-    model = RSMDecisionTransformer(5, 32, 128, 2, 8)
+    model = RSMDecisionTransformer(5, 32, 128, 2, 8,
+                                   max_ep_len=400, max_position_embedding=120)
 
     train_params = TrainingParams(learning_rate=3e-5, batch_size=4, scheduler="none", num_epochs=1000,
                                   clip_grad_norm=1.0)
 
-    dataset = DecisionTransformerGraphDataset(max_size=10000, max_len=40)
+    dataset = DecisionTransformerGraphDataset(max_size=1_000_000, max_len=40)
     agent = DecisionTransformerAgent(env=env, model=model, dataset=dataset, device="cpu")
-    #agent.collect_data(num_episodes=100)
-    #agent.save_dataset(".data/data.pt")
-    agent.load_dataset(".data/data.pt")
-    agent.load_model("model/model_loss_off.pt")
-    agent.evaluate(num_episodes=1)
+    #agent.load_dataset(".data/data.pt")
+    agent.collect_data(num_episodes=500)
+    #agent.load_dataset(".data/data.pt")
+    #agent.load_dataset(".data/data.pt")
+    #agent.dataset.max_len = 40
+    #agent.load_model("model/dt.pt")
+    #agent.evaluate(num_episodes=1)
+    agent.save_dataset(".data/data.pt")
     #agent.train(train_params)
