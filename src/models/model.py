@@ -97,7 +97,7 @@ class StandardModel(BaseSwapModel, nn.Module):
         nn.Module.__init__(self)
         self.num_locations = num_locations
         self.heads = num_heads
-        self.spatial_encoder = GATEncoder(num_layers=4, input_dim=input_dim, embedding_dim=embedding_dim,
+        self.spatial_encoder = GATEncoder(num_layers=3, input_dim=input_dim, embedding_dim=embedding_dim,
                                           hidden_dim=hidden_dim, output_dim=hidden_dim, heads=2)
         self.temporal_encoder = GRUEncoder(hidden_dim * num_heads, hidden_dim, hidden_dim)
         self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
@@ -118,9 +118,6 @@ class StandardModel(BaseSwapModel, nn.Module):
         # Shape B,T,L,D: Batch, Temporal, Locations, Embedding
         temporal_location_embeddings = location_embeddings.view(B, temporal_size, -1, location_embeddings.size(-1))
 
-        # For DQN not needed
-        #add_mask = x.add_mask[location_indices].view(B, temporal_size, self.num_locations)[:, -1, :]
-
         #Shape: B, L, D as we are aggregating over the temporal dimension using LSTM
         temporal_output = self.temporal_encoder(temporal_location_embeddings)
 
@@ -139,78 +136,96 @@ class StandardModel(BaseSwapModel, nn.Module):
 class StandardCrossProductModel(BaseCrossProductActionSpaceModel, nn.Module):
     def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
                  action_layer: int = 1, num_locations: int = 8, num_heads = 2,
-                 remove_clients: bool = True):
+                 use_client_embeddings: bool = True, max_timesteps : int = None):
         BaseCrossProductActionSpaceModel.__init__(self)
         nn.Module.__init__(self)
         self.num_locations = num_locations
         self.heads = num_heads
-        self.remove_clients = remove_clients
-        self.spatial_encoder = GATEncoder(num_layers=4, input_dim=input_dim, embedding_dim=embedding_dim,
+        self.use_client_embeddings = use_client_embeddings
+        self.spatial_encoder = GATEncoder(num_layers=3, input_dim=input_dim, embedding_dim=embedding_dim,
                                           hidden_dim=hidden_dim, output_dim=hidden_dim, heads=2)
         self.temporal_encoder = GRUEncoder(hidden_dim * num_heads, hidden_dim, hidden_dim)
         self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
-        self.action_mapper = StandardCrossProductActionMapper(action_layer, hidden_dim, num_locations,)
+        self.action_mapper = StandardCrossProductActionMapper(action_layer, hidden_dim, num_locations,
+                                                              max_timestep=max_timesteps)
 
-    def forward(self, x, temporal_size: int = 4, return_attn=False):
+    def forward(self, x, timestep: torch.Tensor = None, temporal_size: int = 4, return_attn=False):
         BaseCrossProductActionSpaceModel.forward(self, x)
         all_embeddings = self.spatial_encoder(x)
         B = len(x.batch.unique()) // temporal_size
 
-        if self.remove_clients:
+        if not self.use_client_embeddings:
+            # Select location embeddings only
             location_indices = torch.where(x.label != 0)[0]
-            final_embeddings = all_embeddings[location_indices]
-
+            location_embeddings = all_embeddings[location_indices]
+            temporal_location_embeddings = location_embeddings.view(B, temporal_size, -1, location_embeddings.size(-1))
+            node_embeddings = temporal_location_embeddings
         else:
-            final_embeddings = all_embeddings
+            node_embeddings = all_embeddings.view(B, temporal_size, -1, all_embeddings.size(-1))
 
-        temporal_location_embeddings = final_embeddings.view(B, temporal_size, -1, final_embeddings.size(-1))
 
         #Shape: B, N, D as we are aggregating over the temporal dimension using LSTM
-        temporal_output = self.temporal_encoder(temporal_location_embeddings)
+        temporal_output = self.temporal_encoder(node_embeddings)
 
         #Shape: B, D as we are aggregating over the node dimension using attention
         aggregated_temporal_node_embeddings, attn_weights = self.aggregator(temporal_output)
 
         #Shape: B, L, 2 as we are mapping the aggregated embeddings to actions
-        action_values = self.action_mapper(aggregated_temporal_node_embeddings,) #add_mask)
+        action_values = self.action_mapper(aggregated_temporal_node_embeddings, timestep) #add_mask)
 
         return action_values
 
 
 class StandardValueModel(BaseValueModel, nn.Module):
     def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
-                 num_locations: int = 8, num_heads: int = 2):
+                 num_locations: int = 8, num_heads: int = 2, max_timestep: int = None,
+                 use_client_embeddings=False
+                 ):
         nn.Module.__init__(self)
         BaseValueModel.__init__(self)
         self.num_locations = num_locations
         self.spatial_encoder = GATEncoder(
-            num_layers=4, input_dim=input_dim, embedding_dim=embedding_dim,
+            num_layers=3, input_dim=input_dim, embedding_dim=embedding_dim,
             hidden_dim=hidden_dim, output_dim=hidden_dim, heads=num_heads
         )
+
+        self.use_client_embeddings = use_client_embeddings
+
+        if max_timestep is not None:
+            self.timestep_embedding = nn.Embedding(max_timestep, hidden_dim)
+
         self.temporal_encoder = GRUEncoder(hidden_dim * num_heads, hidden_dim, hidden_dim)
         self.aggregator = AttentionAggregator(hidden_dim, hidden_dim)
 
         # Single output head for value estimation
         self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2 if max_timestep is not None else hidden_dim * 1 , hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1)  # Outputs a single scalar value V(s)
         )
 
-    def forward(self, x, temporal_size: int = 4):
+    def forward(self, x, timestep = None, temporal_size: int = 4):
         all_embeddings = self.spatial_encoder(x)
         B = len(x.batch.unique()) // temporal_size
 
-        # Select location embeddings only
-        location_indices = torch.where(x.label != 0)[0]
-        location_embeddings = all_embeddings[location_indices]
-        temporal_location_embeddings = location_embeddings.view(B, temporal_size, -1, location_embeddings.size(-1))
+        if not self.use_client_embeddings:
+            # Select location embeddings only
+            location_indices = torch.where(x.label != 0)[0]
+            location_embeddings = all_embeddings[location_indices]
+            temporal_location_embeddings = location_embeddings.view(B, temporal_size, -1, location_embeddings.size(-1))
+            node_embeddings = temporal_location_embeddings
+        else:
+            node_embeddings = all_embeddings.view(B, temporal_size, -1, all_embeddings.size(-1))
 
         # Temporal encoding
-        temporal_output = self.temporal_encoder(temporal_location_embeddings)
+        temporal_output = self.temporal_encoder(node_embeddings)
 
         # Aggregate over locations
         aggregated_temporal_node_embeddings, _ = self.aggregator(temporal_output)
+
+        if timestep is not None:
+            timestep_embedding = self.timestep_embedding(timestep)
+            aggregated_temporal_node_embeddings = torch.cat([aggregated_temporal_node_embeddings, timestep_embedding], dim=-1)
 
         # Predict state value V(s)
         # Shape: B, 1
@@ -335,6 +350,87 @@ class CustomDecisionTransformerModel(DecisionTransformerPreTrainedModel):
 
         return action_preds1, action_preds2
 
+class CustomCrossProductDecisionTransformer(nn.Module):
+    def __init__(self, config, num_actions: int):
+        super().__init__(config)
+        self.config = config
+        self.hidden_size = config.hidden_size
+
+        self.encoder = DecisionTransformerGPT2Model(config)
+
+        self.embed_timestep = nn.Embedding(config.max_ep_len, config.hidden_size)
+        self.embed_return = nn.Linear(1, config.hidden_size)
+        self.embed_state = nn.Linear(config.state_dim, config.hidden_size,)
+
+        # Separate embedding layers for two actions
+        self.embed_action = nn.Linear(num_actions, config.hidden_size)
+
+        self.embed_ln = nn.LayerNorm(config.hidden_size)
+
+        # Separate prediction heads for two actions
+        self.predict_action = nn.Linear(config.hidden_size, num_actions)
+        self.predict_state = nn.Linear(config.hidden_size, config.state_dim)
+        self.predict_return = nn.Linear(config.hidden_size, 1)
+
+        self.post_init()
+
+    def forward(
+            self,
+            states: Optional[torch.FloatTensor] = None,
+            actions: Optional[torch.FloatTensor] = None,
+            returns_to_go: Optional[torch.FloatTensor] = None,
+            timesteps: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+    ) -> Tuple[torch.FloatTensor]:
+        batch_size, seq_length = states.shape[0], states.shape[1]
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
+
+        # Embed states, returns, timesteps
+        state_embeddings = self.embed_state(states)
+        returns_embeddings = self.embed_return(returns_to_go)
+        time_embeddings = self.embed_timestep(timesteps)
+
+        # Embed both actions separately
+        action1_embeddings = self.embed_action1(actions[:, :, 0])  # First action
+        action2_embeddings = self.embed_action2(actions[:, :, 1])  # Second action
+
+        # Concatenate action embeddings
+        action_embeddings = torch.cat([action1_embeddings, action2_embeddings], dim=-1)
+
+        # Add time embeddings
+        state_embeddings += time_embeddings
+        action_embeddings += time_embeddings
+        returns_embeddings += time_embeddings
+
+        # Stack input sequence (return, state, action)
+        stacked_inputs = (
+            torch.stack((returns_embeddings, state_embeddings, action_embeddings), dim=1)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, 3 * seq_length, self.hidden_size)
+        )
+        stacked_inputs = self.embed_ln(stacked_inputs)
+
+        # Adjust attention mask
+        stacked_attention_mask = (
+            torch.stack((attention_mask, attention_mask, attention_mask), dim=1)
+            .permute(0, 2, 1)
+            .reshape(batch_size, 3 * seq_length)
+        )
+
+        encoder_outputs = self.encoder(
+            inputs_embeds=stacked_inputs,
+            attention_mask=stacked_attention_mask,
+            position_ids=torch.zeros(stacked_attention_mask.shape, device=stacked_inputs.device, dtype=torch.long),
+        )
+
+        x = encoder_outputs[0].reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
+
+        # Predict actions separately
+        action_preds = self.predict_action(x[:, 1]) # Wyh this sclicing? Because we need of every embedding in shape B,N,D the embedding that corresponds to the state and reward before the action
+
+        return action_preds
 
 class RSMDecisionTransformer(nn.Module):
     def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,

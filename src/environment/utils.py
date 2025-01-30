@@ -1,4 +1,5 @@
 import json
+from typing import List
 
 class CrossProductActionSpace:
     def __init__(self, num_location: int):
@@ -9,13 +10,13 @@ class CrossProductActionSpace:
             for loc2 in range(num_location):
                 self.action_mapping[(loc1, loc2)] = loc1 * num_location + loc2
 
-        self.inv_location_mapping = {v: k for k, v in self.action_mapping.items()}
+        self.inv_action_mapping = {v: k for k, v in self.action_mapping.items()}
         self.num_location = num_location
 
     def to_json(self):
         data = {"action_space": self.action_space,
                 "action_mapping": {str(k): v for k, v in self.action_mapping.items()},
-                "inv_location_mapping": self.inv_location_mapping,
+                "inv_action_mapping": self.inv_action_mapping,
                 "num_location": self.num_location}
 
         with open("action_space.json", "w") as f:
@@ -29,16 +30,34 @@ class CrossProductActionSpace:
         obj = cls(action_mapping["num_location"])
         obj.action_space = action_mapping["action_space"]
         obj.action_mapping = {eval(k): v for k, v in action_mapping["action_mapping"].items()}
-        obj.inv_location_mapping = {int(k): v for k, v in action_mapping["inv_location_mapping"].items()}
+        obj.inv_location_mapping = {int(k): v for k, v in action_mapping["inv_action_mapping"].items()}
         return obj
 
     def __getitem__(self, item):
         if isinstance(item, tuple):
             return self.action_mapping[item]
 
-        return self.inv_location_mapping[item]
+        return self.inv_action_mapping[item]
+
+    def build_add_action_mask(self, addable_locations: List[int]):
+        mask = []
+        for key in sorted(self.inv_action_mapping.keys()):
+            if self.inv_action_mapping[key][0] in addable_locations:
+                mask.append(0)
+            else:
+                mask.append(-float("inf"))
+        return mask
+
+    def build_remove_action_mask(self, removable_locations: List[int]):
+        mask = []
+        for key in sorted(self.inv_action_mapping.keys()):
+            if self.inv_action_mapping[key][1] in removable_locations:
+                mask.append(0)
+            else:
+                mask.append(-float("inf"))
+        return mask
 
 
 if __name__ == "__main__":
-    ca = CrossProductActionSpace.from_json("action_space.json")
+    ca = CrossProductActionSpace.from_json("../data/action_space.json")
     print(ca)

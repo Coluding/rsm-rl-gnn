@@ -258,6 +258,11 @@ class DecisionTransformerAgent:
                 obs = next_obs
 
             self.dataset.add_trajectory(observations, actions, rewards, dones)
+
+            if i % 100 == 0:
+                self.save_dataset(f".data/data_backup{i}.pt")
+
+            logger.info(f"Finished episode [{i}].")
         logger.info("Data collection complete.")
 
     def save_dataset(self, file_path="dataset.pt"):

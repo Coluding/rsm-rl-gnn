@@ -41,14 +41,23 @@ class OffPolicyReplayBuffer:
 class OnPolicyReplayBuffer:
     def __init__(self, capacity, ):
         self.buffer = deque(maxlen=capacity)
-        self.priorities = deque(maxlen=capacity)
 
-    def push(self, state, action, log_prob, reward, next_state, done):
-        self.buffer.append((state, action, log_prob, reward, next_state, done))
+    def push(self, state, action, log_prob, reward, next_state, done, timestep):
+        self.buffer.append((state, action, log_prob, reward, next_state, done, timestep))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         return batch
+
+    def __call__(self, batch_size, shuffle=True):
+        random.shuffle(self.buffer) if shuffle else None
+        buffer = list(self.buffer)
+        for i in range(0, len(self.buffer), batch_size):
+            batch = buffer[i:i + batch_size]
+            yield batch
+
+    def clear(self):
+        self.buffer.clear()
 
     def __len__(self):
         return len(self.buffer)

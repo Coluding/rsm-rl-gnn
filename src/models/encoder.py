@@ -89,6 +89,7 @@ class GATEncoder(BaseSpatialEncoder, nn.Module):
 
     def forward(self, data):
         BaseSpatialEncoder.forward(self, data)
+
         x, edge_index, edge_weight = data.label, data.edge_index, data.weight
         if x.dtype == torch.float32 or x.dtype == torch.float64:
             x = x.long().to(x.device)

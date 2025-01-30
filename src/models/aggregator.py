@@ -313,15 +313,17 @@ class SharedActionMapper(SwapActionMapper, nn.Module):
 
 class InteractiveActionMapper(SwapActionMapper, nn.Module):
     def __init__(self, num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu",
-                 use_attn: bool = False):
+                 use_attn: bool = False, max_timesteps: int = None):
         SwapActionMapper.__init__(self, num_locations)
         nn.Module.__init__(self)
         #TODO: How do we model a no-op: add and remove the same node? But with masking we can't do that in the current setting
         layers = []
 
         for i in range(num_layer):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.Linear(hidden_dim * 2 if max_timesteps is not None and i == 0 else 1, hidden_dim))
             layers.append(self._get_act_fn(act_fn))
+
+        self.timestep_embedding = nn.Embedding(max_timesteps, hidden_dim) if max_timesteps is not None else None
 
         self.shared = nn.Sequential(*layers)
         self.remove = nn.Linear(hidden_dim, num_locations)
@@ -344,8 +346,13 @@ class InteractiveActionMapper(SwapActionMapper, nn.Module):
             case _:
                 raise ValueError(f"Unknown activation function: {act_fn}")
 
-    def forward(self, x, add_mask=None):
+    def forward(self, x, timesteps: torch.Tensor = None, add_mask=None):
         SwapActionMapper.forward(self, x)
+
+        if timesteps is not None:
+            timestep_embedding = self.timestep_embedding(timesteps)
+            x = torch.cat([x, timestep_embedding], dim=-1)
+
         shared_output = self.shared(x)
         remove_scores = self.remove(shared_output)
 
@@ -418,7 +425,7 @@ class SwapBasedAttentionActionMapper(SwapActionNodeMapper, nn.Module):
 
 class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
     def __init__(self, num_layer: int, hidden_dim: int, num_locations: int, act_fn: str = "gelu",
-                 use_attn: bool = False):
+                 use_attn: bool = False, max_timestep: int = None):
         CrossProductSwapActionMapper.__init__(self, num_locations)
         nn.Module.__init__(self)
 
@@ -426,8 +433,11 @@ class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
 
         layers = []
         for i in range(num_layer):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.Linear(hidden_dim * 2 if max_timestep is not None and i == 0 else hidden_dim * 1 , hidden_dim))
             layers.append(self._get_act_fn(act_fn))
+
+        if max_timestep is not None:
+            self.timestep_context_embedding = nn.Embedding(max_timestep, hidden_dim)
 
         self.shared = nn.Sequential(*layers)
         self.add_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
@@ -447,13 +457,14 @@ class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
             case _:
                 raise ValueError(f"Unknown activation function: {act_fn}")
 
-    def forward(self, x,):
+    def forward(self, x, timestep = None):
         CrossProductSwapActionMapper.forward(self, x)
+        if timestep is not None:
+            timestep_embedding = self.timestep_context_embedding(timestep)
+            x = torch.cat([x, timestep_embedding], dim=-1)
         shared_output = self.shared(x)
         add_embedding = self.add_head(shared_output)
         remove_embedding = self.remove_head(shared_output)
-
-        # TODO if self.use_attn:
 
         actions = self.cross_product_action_mapping(torch.cat([add_embedding, remove_embedding], dim=-1))
 

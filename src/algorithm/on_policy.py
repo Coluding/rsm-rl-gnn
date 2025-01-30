@@ -35,11 +35,13 @@ class PPOAgentConfig:
     train_every: int = 50  # Train every n steps
     temporal_size: int = 4
     cross_product_action_space: CrossProductSwapActionMapper = None
+    use_timestep_context: bool = False
 
 
 torch.autograd.set_detect_anomaly(True)
 
 logger = initialize_logger("ppo.log")
+
 
 
 class PPOAgent:
@@ -59,6 +61,8 @@ class PPOAgent:
         self.reward_scaling = config.reward_scaling
         self.train_every = config.train_every
         self.cross_product_action_space = config.cross_product_action_space
+        self.temporal_size = config.temporal_size
+        self.use_timestep_context = config.use_timestep_context
 
         assert not (self.cross_product_action_space is None and isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper)), "Cross Product Action Space is required for CrossProductSwapActionMapper"
 
@@ -71,11 +75,10 @@ class PPOAgent:
         self.replay_buffer = OnPolicyReplayBuffer(self.buffer_size)
 
         self.step = 0
-        self.temporal_size = config.temporal_size
 
         self.writer = SummaryWriter(comment="ppo")
 
-    def select_action(self, state):
+    def select_action(self, state, timestep=None):
         state = state.to(self.device)
         with torch.no_grad():
             if isinstance(self.policy_net.action_mapper, SwapActionMapper):
@@ -90,12 +93,29 @@ class PPOAgent:
                 return (add_action.item(), remove_action.item()), (add_log_prob.item(), remove_log_prob.item())
 
             elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
-                logits = self.policy_net(state, self.temporal_size)
+                logits = self.policy_net(state, timestep, self.temporal_size)
+                mask = self._process_mask(state)
+                logits = logits + mask
                 dist = torch.distributions.Categorical(logits=logits)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
 
                 return action.item(), log_prob.item()
+
+    def _process_mask(self, batched_states, B=1):
+        location_indices = torch.where(batched_states.label != 0)[0]
+        loc_ids = batched_states.name[location_indices].view(B, self.temporal_size, len(self.env.loc_mapping))[:, -1, :]
+        mask = batched_states.add_mask[location_indices].view(B, self.temporal_size, len(self.env.loc_mapping))[:, -1,:]
+
+        zero_mask_index = mask == 0
+        removable_locations = loc_ids[zero_mask_index].view(B, -1).tolist()
+        addable_locations = loc_ids[~zero_mask_index].view(-1, len(self.env.active_locations)).tolist()
+        final_add_mask = [self.cross_product_action_space.build_add_action_mask(x) for x in addable_locations]
+        final_remove_mask = [self.cross_product_action_space.build_remove_action_mask(x) for x in removable_locations]
+
+        final_mask = torch.tensor(final_add_mask) + torch.tensor(final_remove_mask)
+
+        return final_mask.to(self.device)
 
     def compute_advantage(self, rewards, values, dones):
         advantages = torch.zeros_like(rewards, dtype=torch.float)
@@ -110,61 +130,75 @@ class PPOAgent:
 
         return advantages
 
+    def save_model(self, directory: str):
+        torch.save(self.policy_net.state_dict(), directory + "/policy.pth")
+        torch.save(self.value_net.state_dict(), directory + "/value.pth")
+
+    def load_model(self, directory: str):
+        self.policy_net.load_state_dict(torch.load(directory + "/policy.pth"))
+        self.value_net.load_state_dict(torch.load(directory + "/value.pth"))
+
     def train_step(self):
         if len(self.replay_buffer) < self.batch_size:
             return
 
         iterator = tqdm.tqdm(range(self.update_epochs), desc="Running epoch training...", unit="epoch")
         for _ in iterator:
-            # maybe sample with a seed inside the loop
-            batch = self.replay_buffer.sample(self.batch_size)
-            states, actions, old_log_probs, rewards, next_states, dones = zip(*batch)
+            for batch in self.replay_buffer(self.batch_size):
+                states, actions, old_log_probs, rewards, next_states, dones, timesteps = zip(*batch)
 
-            batched_states = Batch.from_data_list(states).to(self.device)
-            batched_next_states = Batch.from_data_list(next_states).to(self.device)
-            actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-            old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-            dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+                batched_states = Batch.from_data_list(states).to(self.device)
+                batched_next_states = Batch.from_data_list(next_states).to(self.device)
+                actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+                old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+                dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+                timesteps = torch.tensor(timesteps, dtype=torch.long, device=self.device) if self.use_timestep_context else None
 
-            if self.reward_scaling:
-                rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+                #if self.reward_scaling:
+                #    rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
 
-            value_loss, advantages = self._value_loss(batched_states, rewards, dones, batched_next_states)
-            policy_loss = self._ppo_loss_logic(batched_states, actions, old_log_probs, advantages)
+                value_loss, advantages = self._value_loss(batched_states, rewards, dones, batched_next_states, timesteps)
+                policy_loss = self._ppo_loss_logic(batched_states, actions, old_log_probs, advantages, timesteps)
 
-            total_loss = policy_loss + value_loss
+                total_loss = policy_loss + value_loss
 
-            self.writer.add_scalar("Policy Loss", policy_loss.item(), self.training_step)
-            self.writer.add_scalar("Value Loss", value_loss.item(), self.training_step)
+                self.writer.add_scalar("Policy Loss", policy_loss.item(), self.training_step)
+                self.writer.add_scalar("Value Loss", value_loss.item(), self.training_step)
 
-            self.optimizer.zero_grad()
-            self.value_optimizer.zero_grad()
+                self.optimizer.zero_grad()
+                self.value_optimizer.zero_grad()
 
-            total_loss.backward()
+                total_loss.backward()
 
-            # log grad norm
-            self.writer.add_scalar("Policy Grad Norm", nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0), self.training_step)
-            self.writer.add_scalar("Value Grad Norm", nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0), self.training_step)
+                # log grad norm
+                self.writer.add_scalar("Policy Grad Norm", nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0), self.training_step)
+                self.writer.add_scalar("Value Grad Norm", nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0), self.training_step)
 
-            nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-            nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
 
-            self.optimizer.step()
-            self.value_optimizer.step()
+                self.optimizer.step()
+                self.value_optimizer.step()
 
-            self.training_step += 1
+                self.training_step += 1
 
-            iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
-            if self.step % 100 == 0:
-                logger.info(f"Policy Loss: {policy_loss.item()}")
-                logger.info(f"Value Loss: {value_loss.item()}")
+                if total_loss < self.best_loss:
+                    self.best_loss = total_loss
+                    torch.save(self.policy_net.state_dict(), "best_policy.pth")
+                    torch.save(self.value_net.state_dict(), "best_value.pth")
+
+                iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
+                if self.step % 100 == 0:
+                    logger.info(f"Policy Loss: {policy_loss.item()}")
+                    logger.info(f"Value Loss: {value_loss.item()}")
 
     def _value_loss(self, batched_states: torch_geometric.data.Data, rewards: torch.Tensor,
                     dones: torch.Tensor, batched_next_states: torch_geometric.data.Data,
+                    timesteps: torch.Tensor = None
                     ):
-        values = self.value_net(batched_states, self.temporal_size).squeeze()
-        next_values = self.value_net(batched_next_states, self.temporal_size).squeeze()
+        values = self.value_net(batched_states, timesteps, self.temporal_size).squeeze()
+        next_values = self.value_net(batched_next_states, timesteps ,self.temporal_size).squeeze()
         advantages = self.compute_advantage(rewards, values, dones)
         value_loss = nn.functional.mse_loss(values, (rewards + self.gamma * next_values * (1 - dones)))
         value_loss = value_loss * self.value_coeff
@@ -172,7 +206,7 @@ class PPOAgent:
         return value_loss, advantages
 
     def _ppo_loss_logic(self, batched_states: torch_geometric.data.Data, actions: torch.Tensor,
-                         old_log_probs: torch.Tensor, advantages: torch.Tensor,):
+                         old_log_probs: torch.Tensor, advantages: torch.Tensor, timesteps : torch.Tensor = None):
 
         if isinstance(self.policy_net.action_mapper, SwapActionMapper):
             add_logits, remove_logits = self.policy_net(batched_states, self.temporal_size)
@@ -191,7 +225,9 @@ class PPOAgent:
             policy_loss = policy_loss - self.entropy_coeff * entropy
 
         elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
-            logits = self.policy_net(batched_states, self.temporal_size)
+            logits = self.policy_net(batched_states, timesteps, self.temporal_size)
+            mask = self._process_mask(batched_states, actions.shape[0])
+            logits = logits + mask
             dist = torch.distributions.Categorical(logits=logits)
             log_probs = dist.log_prob(actions)
             entropy = dist.entropy().mean()
@@ -216,6 +252,7 @@ class PPOAgent:
         iterator = tqdm.tqdm(range(num_episodes), desc="Training PPO...", unit="episode")
         all_rewards = []
         self.training_step = 0
+        self.best_loss = float("inf")
         for episode in iterator:
             state, _ = self.env.reset()
             state = state.to(self.device)
@@ -226,7 +263,7 @@ class PPOAgent:
             rewards = []
 
             while not done:
-                action, log_prob = self.select_action(state)
+                action, log_prob = self.select_action(state, torch.tensor(steps, dtype=torch.long, device=self.device).unsqueeze(0) if self.use_timestep_context else None)
 
                 if not isinstance(action, tuple):
                     env_action = self.cross_product_action_space[action]
@@ -237,7 +274,8 @@ class PPOAgent:
                 next_state, reward, done, _, _ = self.env.step(env_action)
                 next_state = next_state.to(self.device)
                 steps += 1
-                episode_buffer.append((state, action, log_prob, reward, next_state, done))
+                #episode_buffer.append((state, action, log_prob, reward, next_state, done))
+                self.replay_buffer.push(state, action, log_prob, reward, next_state, done, steps)
                 state = next_state
                 total_reward += reward
                 rewards.append(reward)
@@ -246,11 +284,9 @@ class PPOAgent:
 
                 if self.step % self.train_every == 0:
                     self.train_step()
+                    self.replay_buffer.clear()
 
-            for transition in episode_buffer:
-                self.replay_buffer.push(*transition)
 
-            self.train_step() # We need to train one more time after the episode ends
             logger.info(f"Episode {episode}: Total Reward = {total_reward:.4f}")
             logger.info(f"Episode {episode}: Steps = {steps}")
             logger.info("Average Reward: {:.4f}".format(np.mean(rewards)))
