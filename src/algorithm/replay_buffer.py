@@ -56,6 +56,14 @@ class OnPolicyReplayBuffer:
             batch = buffer[i:i + batch_size]
             yield batch
 
+    def normalize_rewards(self):
+        rewards = [t[3] for t in self.buffer]
+        mean = np.mean(rewards)
+        std = np.std(rewards)
+        for i in range(len(self.buffer)):
+            self.buffer[i] = list(self.buffer[i])
+            self.buffer[i][3] = (self.buffer[i][3] - mean) / std
+
     def clear(self):
         self.buffer.clear()
 

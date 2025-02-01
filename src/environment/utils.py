@@ -3,12 +3,14 @@ from typing import List
 
 class CrossProductActionSpace:
     def __init__(self, num_location: int):
-        self.action_space = [i for i in range(num_location**2)]
+        self.action_space = [i for i in range(num_location**2 + 1)]
 
         self.action_mapping = {}
         for loc1 in range(num_location):
             for loc2 in range(num_location):
                 self.action_mapping[(loc1, loc2)] = loc1 * num_location + loc2
+
+        self.action_mapping[(-1, -1)] = num_location**2 # no-op
 
         self.inv_action_mapping = {v: k for k, v in self.action_mapping.items()}
         self.num_location = num_location
@@ -42,7 +44,7 @@ class CrossProductActionSpace:
     def build_add_action_mask(self, addable_locations: List[int]):
         mask = []
         for key in sorted(self.inv_action_mapping.keys()):
-            if self.inv_action_mapping[key][0] in addable_locations:
+            if self.inv_action_mapping[key][0] in addable_locations or self.inv_action_mapping[key][0] == -1:
                 mask.append(0)
             else:
                 mask.append(-float("inf"))
@@ -51,7 +53,7 @@ class CrossProductActionSpace:
     def build_remove_action_mask(self, removable_locations: List[int]):
         mask = []
         for key in sorted(self.inv_action_mapping.keys()):
-            if self.inv_action_mapping[key][1] in removable_locations:
+            if self.inv_action_mapping[key][1] in removable_locations or self.inv_action_mapping[key][0] == -1:
                 mask.append(0)
             else:
                 mask.append(-float("inf"))
@@ -59,5 +61,6 @@ class CrossProductActionSpace:
 
 
 if __name__ == "__main__":
-    ca = CrossProductActionSpace.from_json("../data/action_space.json")
+    ca = CrossProductActionSpace(8)
+    ca.to_json()
     print(ca)

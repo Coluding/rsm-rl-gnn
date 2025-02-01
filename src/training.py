@@ -47,7 +47,7 @@ def ppo(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int = 
     config = FluidityEnvironmentConfig(
         jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
         jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="/home/lukas/flusim/simurun/",
+        configuration_directory_simulator="/home/lukas/flusim/simrun_4000/",
         node_identifier="server0",
         device="cuda",
         feature_dim_node=1,
@@ -117,7 +117,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_every", type=int, default=50)
     parser.add_argument("--stack_states", type=int, default=4)
     parser.add_argument("--eval_every", type=int, default=10)
-    parser.add_argument("--max_timestep", type=bool, default=40)
+    parser.add_argument("--max_timestep", type=bool, default=400)
     parser.add_argument("--use_client_embeddings", type=bool, default=True)
     args = parser.parse_args()
 

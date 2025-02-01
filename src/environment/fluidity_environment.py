@@ -148,13 +148,16 @@ class FluidityEnvironment(Env):
 
 
     def step(self, action: ActType) -> Tuple[ObsType, float, bool, dict]:
-        logger.debug(f"Taking action: {action} = ({self.loc_mapping[action[0]]}, {self.loc_mapping[action[1]]})")
-
+        if action[0] == -1 and action[1] == -1:
+            action = (7,7)
+            logger.debug(f"No action taken")
+        else:
+            logger.debug(f"Taking action: {action} = ({self.loc_mapping[action[0]]}, {self.loc_mapping[action[1]]})")
         reward = 0
 
         # We set a base reward of 0. This is the reward for a no-op action. We only add the reconfiguration costs if
         # the action is not a no-op.
-        if action[0] == action[1]:
+        if action[0] != action[1]:
             reward += self.config.reconfiguration_costs
 
         # What do we do here? We check if the action is valid. A valid action must have an add node from the available
@@ -366,7 +369,7 @@ if __name__ == "__main__":
     env = TorchGraphObservationWrapper(env, one_hot=False)
     env = StackedObservationWrapper(env, stack_size=3)
     obs = env.reset()
-    obs, reward, done, _, _ = env.step((4, 0))
+    obs, reward, done, _, _ = env.step((-1, -1))
     logger.info(f"Reward: {reward}")
     obs, reward, done, _, _ = env.step((0, 4))
     logger.info(f"Reward: {reward}")

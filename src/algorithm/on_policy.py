@@ -8,7 +8,7 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 import tqdm
 from torch_geometric.data import Batch
-import gym
+import matplotlib.pyplot as plt
 from dataclasses import dataclass
 
 from src.algorithm import OnPolicyReplayBuffer
@@ -36,6 +36,7 @@ class PPOAgentConfig:
     temporal_size: int = 4
     cross_product_action_space: CrossProductSwapActionMapper = None
     use_timestep_context: bool = False
+
 
 
 torch.autograd.set_detect_anomaly(True)
@@ -118,33 +119,37 @@ class PPOAgent:
         return final_mask.to(self.device)
 
     def compute_advantage(self, rewards, values, dones):
+        """
+        Computes the generalized advantage estimate
+        """
         advantages = torch.zeros_like(rewards, dtype=torch.float)
 
         last_advantage = 0
         for t in reversed(range(len(rewards))):
             terminal = 1 - dones[t].int()
-            next_value = values[t + 1] if t + 1 < len(rewards) else 0
-            delta = terminal * (rewards[t] + self.gamma * next_value) - values[t]
+            next_value = values[t + 1] if (t + 1 < len(rewards) and not dones[t]) else 0
+            delta = terminal * (rewards[t] + self.gamma * next_value - values[t])
             advantages[t] = delta + self.gamma * self.gae_lambda * terminal * last_advantage
             last_advantage = advantages[t]
 
         return advantages
 
     def save_model(self, directory: str):
-        torch.save(self.policy_net.state_dict(), directory + "/policy.pth")
-        torch.save(self.value_net.state_dict(), directory + "/value.pth")
+        torch.save(self.policy_net.state_dict(), directory + "policy.pth")
+        torch.save(self.value_net.state_dict(), directory + "value.pth")
 
     def load_model(self, directory: str):
-        self.policy_net.load_state_dict(torch.load(directory + "/policy.pth"))
-        self.value_net.load_state_dict(torch.load(directory + "/value.pth"))
+        self.policy_net.load_state_dict(torch.load(directory + "policy.pth"))
+        self.value_net.load_state_dict(torch.load(directory + "value.pth"))
 
     def train_step(self):
         if len(self.replay_buffer) < self.batch_size:
             return
 
+        self.replay_buffer.normalize_rewards()
         iterator = tqdm.tqdm(range(self.update_epochs), desc="Running epoch training...", unit="epoch")
         for _ in iterator:
-            for batch in self.replay_buffer(self.batch_size):
+            for batch in self.replay_buffer(self.batch_size, shuffle=False):
                 states, actions, old_log_probs, rewards, next_states, dones, timesteps = zip(*batch)
 
                 batched_states = Batch.from_data_list(states).to(self.device)
@@ -185,8 +190,8 @@ class PPOAgent:
 
                 if total_loss < self.best_loss:
                     self.best_loss = total_loss
-                    torch.save(self.policy_net.state_dict(), "best_policy.pth")
-                    torch.save(self.value_net.state_dict(), "best_value.pth")
+                    torch.save(self.policy_net.state_dict(), "best_policy_40.pth")
+                    torch.save(self.value_net.state_dict(), "best_value_40.pth")
 
                 iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
                 if self.step % 100 == 0:
@@ -291,6 +296,15 @@ class PPOAgent:
             logger.info(f"Episode {episode}: Steps = {steps}")
             logger.info("Average Reward: {:.4f}".format(np.mean(rewards)))
             logger.info("Rolling Average Reward: {:.4f}".format(np.mean(all_rewards[-100:])))
+
+            if episode % 10 == 0:
+            # Save a plot of the episode reward to tensorboard
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.plot(all_rewards)
+                ax.set_xlabel("Episode")
+                ax.set_ylabel("Reward")
+                ax.set_title("Episode Reward")
+                self.writer.add_figure(f"Episode {episode} Reward", fig, episode)
 
             self.writer.add_scalar("Episode Reward", total_reward, episode)
             self.writer.add_scalar("Average Reward", np.mean(rewards), episode)

@@ -442,7 +442,7 @@ class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
         self.shared = nn.Sequential(*layers)
         self.add_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
         self.remove_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
-        self.cross_product_action_mapping = nn.Linear(hidden_dim * 2, num_locations ** 2)
+        self.cross_product_action_mapping = nn.Linear(hidden_dim * 2, num_locations ** 2 + 1)
 
     def _get_act_fn(self, act_fn: str):
         match act_fn:
