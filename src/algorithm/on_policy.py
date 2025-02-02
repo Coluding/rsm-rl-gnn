@@ -27,15 +27,16 @@ class PPOAgentConfig:
     gae_lambda: float = 0.95
     batch_size: int = 32
     buffer_size: int = 10000
-    clip_epsilon: float = 0.2
+    clip_epsilon: float = 0.3
     entropy_coeff: float = 0.01
-    value_coeff: float = 0.5
+    value_coeff: float = 2
     update_epochs: int = 10
     reward_scaling: bool = False
     train_every: int = 50  # Train every n steps
     temporal_size: int = 4
     cross_product_action_space: CrossProductSwapActionMapper = None
     use_timestep_context: bool = False
+    use_gae: bool = True
 
 
 
@@ -45,7 +46,7 @@ logger = initialize_logger("ppo.log")
 
 
 
-class PPOAgent:
+class OnPolicyAgent:
     def __init__(self, config: PPOAgentConfig):
         self.policy_net = config.policy_net
         self.value_net = config.value_net
@@ -64,6 +65,7 @@ class PPOAgent:
         self.cross_product_action_space = config.cross_product_action_space
         self.temporal_size = config.temporal_size
         self.use_timestep_context = config.use_timestep_context
+        self.use_gae = config.use_gae
 
         assert not (self.cross_product_action_space is None and isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper)), "Cross Product Action Space is required for CrossProductSwapActionMapper"
 
@@ -118,7 +120,7 @@ class PPOAgent:
 
         return final_mask.to(self.device)
 
-    def compute_advantage(self, rewards, values, dones):
+    def compute_gae(self, rewards, values, dones):
         """
         Computes the generalized advantage estimate
         """
@@ -134,6 +136,75 @@ class PPOAgent:
 
         return advantages
 
+    def compute_reward_to_go(rewards, gamma=0.99):
+        """
+        Computes reward-to-go for each timestep t:
+        G_t = r_t + γ r_{t+1} + γ^2 r_{t+2} + ... + γ^(T-t) r_T
+        """
+        G = torch.zeros_like(rewards, dtype=torch.float)
+        future_return = 0
+        for t in reversed(range(len(rewards))):
+            future_return = rewards[t] + gamma * future_return
+            G[t] = future_return
+        return G
+
+    def compute_reward_to_go_with_baseline(self, rewards):
+        """
+        Computes reward-to-go for each timestep t and subtracts baseline (mean return).
+        G_t = r_t + γ r_{t+1} + γ^2 r_{t+2} + ... + γ^(T-t) r_T
+        Baseline: mean of all G_t values in the episode.
+        """
+        G = torch.zeros_like(rewards, dtype=torch.float)
+        future_return = 0
+        for t in reversed(range(len(rewards))):
+            future_return = rewards[t] + self.gamma * future_return
+            G[t] = future_return
+
+        baseline = G.mean()
+
+        return G - baseline
+
+    def compute_advantage_normal(self, rewards, values, dones):
+        """
+        Computes the normal one-step advantage: A_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+        """
+        advantages = torch.zeros_like(rewards, dtype=torch.float)
+
+        for t in range(len(rewards)):
+            next_value = values[t + 1] if (t + 1 < len(rewards) and not dones[t]) else 0
+            advantages[t] = rewards[t] + self.gamma * next_value - values[t]
+
+        return advantages
+
+    def compute_clipped_advantage(self, rewards, values, dones):
+        """
+        Computes the clipped advamtage to ensure smooth training
+        """
+
+    def train_step_reinforce(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        for batch in self.replay_buffer(self.batch_size, shuffle=False):
+            states, actions, _, rewards, _, dones, _ = zip(*batch)
+
+            batched_states = Batch.from_data_list(states).to(self.device)
+            actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+
+            # Compute baseline-subtracted reward-to-go
+            reward_to_go = self.compute_reward_to_go_with_baseline(rewards)
+
+            # Compute policy loss
+            logits = self.policy_net(batched_states)
+            dist = torch.distributions.Categorical(logits=logits)
+            log_probs = dist.log_prob(actions)
+            policy_loss = -torch.mean(log_probs * reward_to_go)  # Policy gradient update
+
+            self.optimizer.zero_grad()
+            policy_loss.backward()
+            self.optimizer.step()
+
     def save_model(self, directory: str):
         torch.save(self.policy_net.state_dict(), directory + "policy.pth")
         torch.save(self.value_net.state_dict(), directory + "value.pth")
@@ -146,7 +217,7 @@ class PPOAgent:
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        self.replay_buffer.normalize_rewards()
+        #self.replay_buffer.normalize_rewards() if self.reward_scaling else None
         iterator = tqdm.tqdm(range(self.update_epochs), desc="Running epoch training...", unit="epoch")
         for _ in iterator:
             for batch in self.replay_buffer(self.batch_size, shuffle=False):
@@ -190,8 +261,8 @@ class PPOAgent:
 
                 if total_loss < self.best_loss:
                     self.best_loss = total_loss
-                    torch.save(self.policy_net.state_dict(), "best_policy_40.pth")
-                    torch.save(self.value_net.state_dict(), "best_value_40.pth")
+                    torch.save(self.policy_net.state_dict(), "best_policy.pth")
+                    torch.save(self.value_net.state_dict(), "best_value.pth")
 
                 iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
                 if self.step % 100 == 0:
@@ -204,7 +275,7 @@ class PPOAgent:
                     ):
         values = self.value_net(batched_states, timesteps, self.temporal_size).squeeze()
         next_values = self.value_net(batched_next_states, timesteps ,self.temporal_size).squeeze()
-        advantages = self.compute_advantage(rewards, values, dones)
+        advantages = self.compute_gae(rewards, values, dones) if self.use_gae else self.compute_advantage_normal(rewards, values, dones)
         value_loss = nn.functional.mse_loss(values, (rewards + self.gamma * next_values * (1 - dones)))
         value_loss = value_loss * self.value_coeff
 
@@ -258,6 +329,9 @@ class PPOAgent:
         all_rewards = []
         self.training_step = 0
         self.best_loss = float("inf")
+
+        action_history = []  # Store actions per episode
+
         for episode in iterator:
             state, _ = self.env.reset()
             state = state.to(self.device)
@@ -266,6 +340,7 @@ class PPOAgent:
             steps = 0
             episode_buffer = []
             rewards = []
+            episode_actions = []
 
             while not done:
                 action, log_prob = self.select_action(state, torch.tensor(steps, dtype=torch.long, device=self.device).unsqueeze(0) if self.use_timestep_context else None)
@@ -275,6 +350,7 @@ class PPOAgent:
 
                 else:
                     env_action = action
+
 
                 next_state, reward, done, _, _ = self.env.step(env_action)
                 next_state = next_state.to(self.device)
@@ -287,9 +363,12 @@ class PPOAgent:
                 all_rewards.append(reward)
                 self.step += 1
 
+                episode_actions.append(action)
+
                 if self.step % self.train_every == 0:
                     self.train_step()
                     self.replay_buffer.clear()
+
 
 
             logger.info(f"Episode {episode}: Total Reward = {total_reward:.4f}")
@@ -297,14 +376,27 @@ class PPOAgent:
             logger.info("Average Reward: {:.4f}".format(np.mean(rewards)))
             logger.info("Rolling Average Reward: {:.4f}".format(np.mean(all_rewards[-100:])))
 
+            action_history.extend(episode_actions)
+
             if episode % 10 == 0:
             # Save a plot of the episode reward to tensorboard
                 fig, ax = plt.subplots(figsize=(12, 6))
-                ax.plot(all_rewards)
-                ax.set_xlabel("Episode")
+                ax.plot(rewards)
+                ax.set_xlabel("Step")
                 ax.set_ylabel("Reward")
                 ax.set_title("Episode Reward")
                 self.writer.add_figure(f"Episode {episode} Reward", fig, episode)
+
+                if not isinstance(action, tuple) :
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    ax.hist(episode_actions, bins=np.arange(min(episode_actions) - 0.5, max(episode_actions) + 1.5, 1),
+                            edgecolor="black")
+                    ax.set_xlabel("Action")
+                    ax.set_ylabel("Frequency")
+                    ax.set_title("Action Selection Histogram (Last 10 Episodes)")
+                    self.writer.add_figure(f"Episode {episode} Action Histogram", fig, episode)
+                    action_history.clear()
+
 
             self.writer.add_scalar("Episode Reward", total_reward, episode)
             self.writer.add_scalar("Average Reward", np.mean(rewards), episode)

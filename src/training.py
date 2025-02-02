@@ -46,7 +46,7 @@ def ppo(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int = 
 
     config = FluidityEnvironmentConfig(
         jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
-        jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
+        jvm_options=['-Djava.security.properties=/home/lukas/flusim/simrun_4000/server0/xmr/config/java.security'],
         configuration_directory_simulator="/home/lukas/flusim/simrun_4000/",
         node_identifier="server0",
         device="cuda",
@@ -86,7 +86,7 @@ def ppo(type_embedding_dim: int = 12, hidden_dim: int = 64, action_layer: int = 
                                   temporal_size=stack_states, cross_product_action_space=ca,
                                   use_timestep_context=use_timestep_context is not None)
 
-    agent = PPOAgent(agent_config)
+    agent = OnPolicyAgent(agent_config)
     agent.train(num_episodes)
 
 
@@ -100,8 +100,8 @@ if __name__ == "__main__":
     parser.add_argument("--action_layer", type=int, default=2)
     parser.add_argument("--num_locations", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--buffer_size", type=int, default=10000)
     parser.add_argument("--target_update", type=int, default=10)
@@ -109,12 +109,12 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=float, default=1.0)
     parser.add_argument("--epsilon_decay", type=float, default=0.995)
     parser.add_argument("--epsilon_min", type=float, default=0.1)
-    parser.add_argument("--clip_epsilon", type=float, default=0.2)
-    parser.add_argument("--entropy_coeff", type=float, default=0.01)
-    parser.add_argument("--value_coeff", type=float, default=0.5)
-    parser.add_argument("--update_epochs", type=int, default=10)
+    parser.add_argument("--clip_epsilon", type=float, default=0.3)
+    parser.add_argument("--entropy_coeff", type=float, default=0.3)
+    parser.add_argument("--value_coeff", type=float, default=1)
+    parser.add_argument("--update_epochs", type=int, default=50)
     parser.add_argument("--reward_scaling", type=bool, default=False)
-    parser.add_argument("--train_every", type=int, default=50)
+    parser.add_argument("--train_every", type=int, default=400)
     parser.add_argument("--stack_states", type=int, default=4)
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument("--max_timestep", type=bool, default=400)

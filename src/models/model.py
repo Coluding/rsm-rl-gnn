@@ -350,7 +350,7 @@ class CustomDecisionTransformerModel(DecisionTransformerPreTrainedModel):
 
         return action_preds1, action_preds2
 
-class CustomCrossProductDecisionTransformer(nn.Module):
+class CustomCrossProductDecisionTransformer(DecisionTransformerPreTrainedModel):
     def __init__(self, config, num_actions: int):
         super().__init__(config)
         self.config = config
@@ -393,11 +393,7 @@ class CustomCrossProductDecisionTransformer(nn.Module):
         time_embeddings = self.embed_timestep(timesteps)
 
         # Embed both actions separately
-        action1_embeddings = self.embed_action1(actions[:, :, 0])  # First action
-        action2_embeddings = self.embed_action2(actions[:, :, 1])  # Second action
-
-        # Concatenate action embeddings
-        action_embeddings = torch.cat([action1_embeddings, action2_embeddings], dim=-1)
+        action_embeddings = self.embed_action(actions)  # First action
 
         # Add time embeddings
         state_embeddings += time_embeddings
@@ -428,12 +424,12 @@ class CustomCrossProductDecisionTransformer(nn.Module):
         x = encoder_outputs[0].reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
 
         # Predict actions separately
-        action_preds = self.predict_action(x[:, 1]) # Wyh this sclicing? Because we need of every embedding in shape B,N,D the embedding that corresponds to the state and reward before the action
+        action_preds = self.predict_action(x[:, 1]) # Why this slicing? Because we need of every embedding in shape B,N,D the embedding that corresponds to the state and reward before the action
 
         return action_preds
 
 class RSMDecisionTransformer(nn.Module):
-    def __init__(self, input_dim: int, embedding_dim: int, hidden_dim: int,
+    def __init__(self, cross_product: bool, input_dim: int, embedding_dim: int, hidden_dim: int,
                  dt_heads: int = 4, num_locations: int = 8, max_ep_len: int = 40,
                  max_position_embedding: int = 400):
 
@@ -451,7 +447,10 @@ class RSMDecisionTransformer(nn.Module):
 
         self.aggregator = AttentionAggregator(2 * hidden_dim, hidden_dim)
 
-        self.dt = CustomDecisionTransformerModel(self.dt_config, num_actions_1=num_locations, num_actions_2=num_locations)
+        if cross_product:
+            self.dt = CustomCrossProductDecisionTransformer(self.dt_config, num_actions=num_locations)
+        else:
+            self.dt = CustomDecisionTransformerModel(self.dt_config, num_actions_1=num_locations, num_actions_2=num_locations)
 
 
     def forward(self,

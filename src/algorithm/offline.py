@@ -7,12 +7,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.data import Batch
-from src.models.model import RSMDecisionTransformer
+from src.models.model import RSMDecisionTransformer, CustomCrossProductDecisionTransformer
 from src.utils import initialize_logger
 import os
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
+from src.environment import CrossProductActionSpace
 
 
 
@@ -228,12 +229,15 @@ class DecisionTransformerGraphDataset(Dataset):
 
 
 class DecisionTransformerAgent:
-    def __init__(self, env = None, model = None, dataset = None, device="cuda"):
+    def __init__(self, env = None, model = None, dataset = None, device="cuda",
+                 cross_product_action_space : CrossProductActionSpace=None):
         self.env = env
         self.device = device
         self.dataset = dataset
         self.model = model.to(device)
         self.criterion = nn.CrossEntropyLoss()
+        self.cross_product_action_space = cross_product_action_space
+
 
     def collect_data(self, num_episodes=100):
         """Collects experience trajectories from the environment."""
@@ -321,6 +325,10 @@ class DecisionTransformerAgent:
 
                 # Extract batch elements
                 graphs = batch["graphs"].to(self.device)
+
+                if self.cross_product_action_space is not None:
+                    batch["actions"] = torch.stack([torch.tensor([self.cross_product_action_space.inv_action_mapping[action.item()] for action in actions]) for actions in batch["actions"]])
+
                 actions = batch["actions"].to(self.device)
                 returns_to_go = batch["returns_to_go"].to(self.device)
                 timesteps = batch["timesteps"].to(self.device)
@@ -331,7 +339,7 @@ class DecisionTransformerAgent:
                 )
 
                 loss1 = self._compute_masked_ce_loss(pred_actions[0], actions[:, :, 0], attention_mask)
-                loss2 = self._compute_masked_ce_loss(pred_actions[1], actions[:, :, 1], attention_mask)
+                loss2 = self._compute_masked_ce_loss(pred_actions[1], actions[:, :, 1], attention_mask) if self.cross_product_action_space is not None else 0
                 loss = loss1 + loss2
                 loss.backward()
 
@@ -466,20 +474,21 @@ if __name__ == "__main__":
 
     env = FluidityEnvironment(config)
     env = TorchGraphObservationWrapper(env, one_hot=False)
-    model = RSMDecisionTransformer(5, 32, 128, 2, 8,
+    model = RSMDecisionTransformer(True, 5, 32, 128, 2, 8,
                                    max_ep_len=400, max_position_embedding=120)
 
     train_params = TrainingParams(learning_rate=3e-5, batch_size=4, scheduler="none", num_epochs=1000,
                                   clip_grad_norm=1.0)
 
     dataset = DecisionTransformerGraphDataset(max_size=1_000_000, max_len=40)
-    agent = DecisionTransformerAgent(env=env, model=model, dataset=dataset, device="cpu")
-    #agent.load_dataset(".data/data.pt")
-    agent.collect_data(num_episodes=500)
+    ca = CrossProductActionSpace.from_json("../data/action_space.json")
+    agent = DecisionTransformerAgent(env=env, model=model, dataset=dataset, device="cpu", cross_product_action_space=ca)
+    agent.load_dataset(".data/data_backup500.pt")
+    #agent.collect_data(num_episodes=500)
     #agent.load_dataset(".data/data.pt")
     #agent.load_dataset(".data/data.pt")
     #agent.dataset.max_len = 40
     #agent.load_model("model/dt.pt")
     #agent.evaluate(num_episodes=1)
-    agent.save_dataset(".data/data.pt")
-    #agent.train(train_params)
+    #agent.save_dataset(".data/data.pt")
+    agent.train(train_params)
