@@ -357,11 +357,11 @@ class StackedBatchObservationWrapper(TorchGraphObservationWrapper):
 
 if __name__ == "__main__":
     config = FluidityEnvironmentConfig(
-        jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
-        jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="/home/lukas/flusim/simrun_4000/",
+        jar_path="/Users/lukasbierling/PycharmProjects/rsm-rl-gnn/ressources/jars/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
+        jvm_options=['-Djava.security.properties=/Users/lukasbierling/PycharmProjects/rsm-rl-gnn/ressources/simurun/server0/xmr/config/java.security'],
+        configuration_directory_simulator="/Users/lukasbierling/PycharmProjects/rsm-rl-gnn/ressources/simurun/",
         node_identifier="server0",
-        device="cuda",
+        device="cpu",
         feature_dim_node=1
     )
 

@@ -1,3 +1,5 @@
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data, Batch
@@ -9,7 +11,6 @@ import torch.optim as optim
 from torch_geometric.data import Batch
 from src.models.model import RSMDecisionTransformer, CustomCrossProductDecisionTransformer
 from src.utils import initialize_logger
-import os
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
@@ -327,7 +328,7 @@ class DecisionTransformerAgent:
                 graphs = batch["graphs"].to(self.device)
 
                 if self.cross_product_action_space is not None:
-                    batch["actions"] = torch.stack([torch.tensor([self.cross_product_action_space.inv_action_mapping[action.item()] for action in actions]) for actions in batch["actions"]])
+                    batch["actions"] = torch.stack([torch.tensor([self.cross_product_action_space[action[0].long().item(), action[1].long().item()] for action in actions]) for actions in batch["actions"]])
 
                 actions = batch["actions"].to(self.device)
                 returns_to_go = batch["returns_to_go"].to(self.device)
@@ -338,9 +339,13 @@ class DecisionTransformerAgent:
                     graphs, actions, returns_to_go, timesteps, attention_mask
                 )
 
-                loss1 = self._compute_masked_ce_loss(pred_actions[0], actions[:, :, 0], attention_mask)
-                loss2 = self._compute_masked_ce_loss(pred_actions[1], actions[:, :, 1], attention_mask) if self.cross_product_action_space is not None else 0
-                loss = loss1 + loss2
+                if self.cross_product_action_space is not None:
+                    loss = self._compute_masked_ce_loss(pred_actions, actions, attention_mask)
+                else:
+                    loss1 = self._compute_masked_ce_loss(pred_actions[0], actions[:, :, 0], attention_mask)
+                    loss2 = self._compute_masked_ce_loss(pred_actions[1], actions[:, :, 1], attention_mask)
+                    loss = loss1 + loss2
+
                 loss.backward()
 
                 if train_params.clip_grad_norm > 0:
@@ -365,7 +370,7 @@ class DecisionTransformerAgent:
 
     def _compute_masked_ce_loss(self, pred_action: torch.Tensor, targets: torch.Tensor,
                                 padding_mask: torch.Tensor, reduction: str ="mean"):
-        logits = pred_action.view(-1, self.model.num_locations)
+        logits = pred_action.view(-1, self.model.num_locations ** 2 + 1 if self.cross_product_action_space is not None else self.model.num_locations)
 
         # Targets: (batch_size, seq_len) → (batch_size * seq_len)
         targets = targets.reshape(-1)
@@ -464,11 +469,11 @@ if __name__ == "__main__":
     from src.environment import FluidityEnvironment, FluidityEnvironmentConfig, TorchGraphObservationWrapper
 
     config = FluidityEnvironmentConfig(
-        jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
-        jvm_options=['-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="/home/lukas/flusim/simrun_4000/",
+        jar_path="../../ressources/jars/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
+        jvm_options=['-Djava.security.properties=../../ressources/simurun/server0/xmr/config/java.security'],
+        configuration_directory_simulator="../../ressources/simrun_4000/",
         node_identifier="server0",
-        device="cpu",
+        device="mps",
         feature_dim_node=1
     )
 
