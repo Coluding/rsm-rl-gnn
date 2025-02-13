@@ -442,7 +442,7 @@ class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
         self.shared = nn.Sequential(*layers)
         self.add_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
         self.remove_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), self._get_act_fn(act_fn))
-        self.cross_product_action_mapping = nn.Linear(hidden_dim * 2, num_locations ** 2 + 1)
+        self.cross_product_action_mapping = nn.Linear(hidden_dim * 2, int((num_locations * (num_locations - 1)) + 1))
 
     def _get_act_fn(self, act_fn: str):
         match act_fn:
@@ -470,6 +470,22 @@ class StandardCrossProductActionMapper(CrossProductSwapActionMapper, nn.Module):
 
         return actions
 
+
+class RewardModel(nn.Module):
+    def __init__(self, hidden_dim: int, state_dim: int):
+        super(RewardModel, self).__init__()
+
+        self.fc1 = nn.Linear(hidden_dim + state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 2)
+
+    def forward(self, h: torch.Tensor, s: torch.Tensor):
+        x = torch.cat([h, s], dim=-1)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+
+        return x
 
 
 

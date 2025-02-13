@@ -439,7 +439,7 @@ class RSMDecisionTransformer(nn.Module):
                                           hidden_dim=hidden_dim, output_dim=hidden_dim, heads=2,)
 
         self.dt_config = DecisionTransformerConfig(state_dim=hidden_dim * 2, n_head=dt_heads, num_layers=2,
-                                                   act_dim=num_locations,
+                                                   act_dim=num_locations if not cross_product else (num_locations * (num_locations - 1)) + 1,
                                                    max_ep_len=max_ep_len, action_tanh=False,
                                                    vocab_size=num_locations,
                                                    max_position_embeddings=max_position_embedding,
@@ -473,7 +473,7 @@ class RSMDecisionTransformer(nn.Module):
 
         #ohe action
         action[action == -1] = 0
-        action_ohe = F.one_hot(action.long(), num_classes=self.num_locations).float()
+        action_ohe = F.one_hot(action.long(), num_classes=self.num_locations if isinstance(self.dt, CustomDecisionTransformerModel) else (self.num_locations * (self.num_locations - 1) + 1).float())
 
         # We do not pass an attention mask yet because it is only for apssing not causality. That is handled by the GPT internally
         out = self.dt.forward(graph_embedding,

@@ -1,0 +1,96 @@
+{
+    "configuration": {
+        "name": "Default",
+        "status": "error",
+        "appenders": {
+            "Console": {
+                "name": "Console",
+                "target": "SYSTEM_OUT",
+                "PatternLayout": {
+                    "pattern": "%d{HH:mm:ss.SSS} [%t] %-5level (%logger{36}) :: %msg%n%ex"
+                }
+            },
+            "File": {
+                "name": "Optimization",
+                "append": "false",
+                "fileName": "./../optimization.log",
+                "PatternLayout": {
+                    "pattern": "%d{HH:mm:ss.SSS} [%t] %-5level %c{1} - %msg%n"
+                }
+            }
+        },
+        "loggers": {
+            "root": {
+                "level": "info",
+                "appenderRef": [
+                    {
+                        "ref": "Console"
+                    }
+                ]
+            },
+            "logger": [
+                {
+                    "name": "de.optscore.optimization",
+                    "level": "debug",
+                    "additivity": "false",
+                    "appenderRef": [
+                        {
+                            "ref": "Optimization"
+                        }
+                    ]
+                },
+                {
+                    "name": "de.emusphere.measurements",
+                    "level": "info",
+                    "additivity": "false",
+                    "appenderRef": [
+                        {
+                            "ref": "Console"
+                        }
+                    ]
+                },
+                {
+                    "name": "de.emusphere.coordination.service.agents",
+                    "level": "debug",
+                    "additivity": "false",
+                    "appenderRef": [
+                        {
+                            "ref": "Console"
+                        }
+                    ]
+                },
+                {
+                    "name": "io.netty",
+                    "level": "info",
+                    "additivity": "false",
+                    "appenderRef": [
+                        {
+                            "ref": "Console"
+                        }
+                    ]
+                },
+                {
+                    "name": "bftsmart",
+                    "level": "info",
+                    "additivity": "false",
+                    "appenderRef": [
+                        {
+                            "ref": "Console"
+                        }
+                    ]
+                },
+                {
+                    "name": "bftsmart.location.management",
+                    "level": "info",
+                    "additivity": "false",
+                    "appenderRef": [
+                        {
+                            "ref": "Console"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
+

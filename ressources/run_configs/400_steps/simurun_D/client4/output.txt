@@ -1,0 +1,2 @@
+16:45:31.510 [main] INFO  (de.optscore.simulator.FluiditySimulator) :: Initializing FluiditySimulator on node client4 with configuration directory /home/lukas/flusim/run.
+16:45:31.513 [main] INFO  (de.optscore.simulator.FluiditySimulator) :: Writing dummy output for node client4 to.
