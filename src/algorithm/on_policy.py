@@ -10,6 +10,7 @@ import tqdm
 from torch_geometric.data import Batch
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
+from typing import Literal
 
 from src.algorithm import OnPolicyReplayBuffer
 from src.models.model import BaseSwapModel, BaseValueModel, SwapActionMapper, CrossProductSwapActionMapper
@@ -18,11 +19,13 @@ from src.environment import initialize_logger
 
 
 @dataclass()
-class PPOAgentConfig:
+class OnPolicyAgentConfig:
+    algorithm: Literal["PPO", "REINFORCE"]
     policy_net: BaseSwapModel
-    value_net: BaseValueModel
     env: gym.Env
+    value_net: BaseValueModel = None
     lr: float = 3e-4
+    lr_value_fn: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     batch_size: int = 32
@@ -47,11 +50,13 @@ logger = initialize_logger("ppo.log")
 
 
 class OnPolicyAgent:
-    def __init__(self, config: PPOAgentConfig):
+    def __init__(self, config: OnPolicyAgentConfig):
+        self.algorithm = config.algorithm
         self.policy_net = config.policy_net
         self.value_net = config.value_net
         self.env = config.env
         self.lr = config.lr
+        self.value_lr = config.lr_value_fn
         self.gamma = config.gamma
         self.gae_lambda = config.gae_lambda
         self.batch_size = config.batch_size
@@ -71,15 +76,19 @@ class OnPolicyAgent:
 
         self.device = self.env.config.device
         self.policy_net.to(self.device)
-        self.value_net.to(self.device)
+        self.value_net.to(self.device) if self.value_net is not None else None
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=self.lr)
+        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=self.value_lr) if self.value_net is not None else None
         self.replay_buffer = OnPolicyReplayBuffer(self.buffer_size)
 
         self.step = 0
 
-        self.writer = SummaryWriter(comment="ppo")
+        self.writer = SummaryWriter(comment="ppo" if self.algorithm == "PPO" else "reinforce")
+
+    def load_model(self, directory: str):
+        self.policy_net.load_state_dict(torch.load(directory + "policy.pth"))
+        self.value_net.load_state_dict(torch.load(directory + "value.pth"))
 
     def select_action(self, state, timestep=None):
         state = state.to(self.device)
@@ -185,25 +194,44 @@ class OnPolicyAgent:
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        for batch in self.replay_buffer(self.batch_size, shuffle=False):
-            states, actions, _, rewards, _, dones, _ = zip(*batch)
+        iterator = tqdm.tqdm(range(self.update_epochs), desc="Running epoch training...", unit="epoch")
+        for _ in iterator:
+            epoch_loss = 0
+            for batch in self.replay_buffer(self.batch_size, shuffle=False):
+                states, actions, _, rewards, _, dones, timesteps = zip(*batch)
 
-            batched_states = Batch.from_data_list(states).to(self.device)
-            actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+                batched_states = Batch.from_data_list(states).to(self.device)
+                actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+                timesteps = torch.tensor(timesteps, dtype=torch.long, device=self.device) if self.use_timestep_context else None
 
-            # Compute baseline-subtracted reward-to-go
-            reward_to_go = self.compute_reward_to_go_with_baseline(rewards)
 
-            # Compute policy loss
-            logits = self.policy_net(batched_states)
-            dist = torch.distributions.Categorical(logits=logits)
-            log_probs = dist.log_prob(actions)
-            policy_loss = -torch.mean(log_probs * reward_to_go)  # Policy gradient update
+                # Compute baseline-subtracted reward-to-go
+                reward_to_go = self.compute_reward_to_go_with_baseline(rewards)
 
-            self.optimizer.zero_grad()
-            policy_loss.backward()
-            self.optimizer.step()
+                # Compute policy loss
+                logits = self.policy_net(batched_states, timesteps)
+                dist = torch.distributions.Categorical(logits=logits)
+                log_probs = dist.log_prob(actions)
+                policy_loss = -torch.mean(log_probs * reward_to_go)  # Policy gradient update
+
+                self.optimizer.zero_grad()
+                policy_loss.backward()
+                self.optimizer.step()
+
+                epoch_loss += policy_loss.item()
+                self.writer.add_scalar("Policy Loss", policy_loss.item(), self.training_step)
+                iterator.set_postfix({"Policy Loss": policy_loss.item()})
+
+                self.training_step += 1
+
+                if policy_loss < self.best_loss:
+                    self.best_loss = policy_loss
+                    torch.save(self.policy_net.state_dict(), "best_policy_re.pth")
+
+            self.writer.add_scalar("Epoch Loss", epoch_loss)
+
+        self.replay_buffer.clear()
 
     def save_model(self, directory: str):
         torch.save(self.policy_net.state_dict(), directory + "policy.pth")
@@ -248,11 +276,11 @@ class OnPolicyAgent:
                 total_loss.backward()
 
                 # log grad norm
-                self.writer.add_scalar("Policy Grad Norm", nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0), self.training_step)
-                self.writer.add_scalar("Value Grad Norm", nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0), self.training_step)
+                policy_grad_norm = nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                value_grad_norm = nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
 
-                nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-                nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+                self.writer.add_scalar("Policy Grad Norm", policy_grad_norm, self.training_step)
+                self.writer.add_scalar("Value Grad Norm", value_grad_norm, self.training_step)
 
                 self.optimizer.step()
                 self.value_optimizer.step()
@@ -265,9 +293,8 @@ class OnPolicyAgent:
                     torch.save(self.value_net.state_dict(), "best_value.pth")
 
                 iterator.set_postfix({"Policy Loss": policy_loss.item(), "Value Loss": value_loss.item()})
-                if self.step % 100 == 0:
-                    logger.info(f"Policy Loss: {policy_loss.item()}")
-                    logger.info(f"Value Loss: {value_loss.item()}")
+
+        self.replay_buffer.clear()
 
     def _value_loss(self, batched_states: torch_geometric.data.Data, rewards: torch.Tensor,
                     dones: torch.Tensor, batched_next_states: torch_geometric.data.Data,
@@ -278,6 +305,12 @@ class OnPolicyAgent:
         advantages = self.compute_gae(rewards, values, dones) if self.use_gae else self.compute_advantage_normal(rewards, values, dones)
         value_loss = nn.functional.mse_loss(values, (rewards + self.gamma * next_values * (1 - dones)))
         value_loss = value_loss * self.value_coeff
+
+        # log example values
+        if self.training_step % 200 == 0:
+            logger.info(f"Example Values: {str(values.tolist())}")
+            logger.info("Corresponding rewards: ", str(rewards.tolist()))
+            logger.info("Next Values: ", str(next_values.tolist()))
 
         return value_loss, advantages
 
@@ -300,6 +333,8 @@ class OnPolicyAgent:
             policy_loss = policy_loss - torch.min(ratio_remove * advantages, clipped_ratio_remove * advantages).mean()
             policy_loss = policy_loss - self.entropy_coeff * entropy
 
+            self.writer.add_scalar("Entropy", entropy, self.training_step)
+
         elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
             logits = self.policy_net(batched_states, timesteps, self.temporal_size)
             mask = self._process_mask(batched_states, actions.shape[0])
@@ -313,14 +348,18 @@ class OnPolicyAgent:
             policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
             policy_loss = policy_loss - self.entropy_coeff * entropy
 
+            self.writer.add_scalar("Entropy", entropy, self.training_step)
+            self.writer.add_scalar("Ratio", ratio.mean(), self.training_step)
+
         else:
             raise NotImplementedError(f"Action mapper of type {type(self.policy_net.action_mapper)} not supported")
 
-        if self.step % 100 == 0:
+        if self.step % 1000 == 0:
             if isinstance(self.policy_net.action_mapper, SwapActionMapper):
                 logger.info(f"Example Probabilities: {add_dist.probs.tolist()[0]}, {remove_dist.probs.tolist()[0]}")
             elif isinstance(self.policy_net.action_mapper, CrossProductSwapActionMapper):
                 logger.info(f"Example Probabilities: {dist.probs.tolist()[0]}")
+
 
         return policy_loss
 
@@ -341,6 +380,9 @@ class OnPolicyAgent:
             episode_buffer = []
             rewards = []
             episode_actions = []
+            raw_actions = []
+
+            starting_locs = self.env.active_locations
 
             while not done:
                 action, log_prob = self.select_action(state, torch.tensor(steps, dtype=torch.long, device=self.device).unsqueeze(0) if self.use_timestep_context else None)
@@ -351,12 +393,11 @@ class OnPolicyAgent:
                 else:
                     env_action = action
 
-
                 next_state, reward, done, _, _ = self.env.step(env_action)
                 next_state = next_state.to(self.device)
                 steps += 1
                 #episode_buffer.append((state, action, log_prob, reward, next_state, done))
-                self.replay_buffer.push(state, action, log_prob, reward, next_state, done, steps)
+                self.replay_buffer.push(state, action, log_prob, -reward, next_state, done, steps)
                 state = next_state
                 total_reward += reward
                 rewards.append(reward)
@@ -364,27 +405,31 @@ class OnPolicyAgent:
                 self.step += 1
 
                 episode_actions.append(action)
+                raw_actions.append(env_action)
 
                 if self.step % self.train_every == 0:
-                    self.train_step()
-                    self.replay_buffer.clear()
+                    match self.algorithm:
+                        case "PPO":
+                            self.train_step()
+                        case "REINFORCE":
+                            self.train_step_reinforce()
 
-
-
-            logger.info(f"Episode {episode}: Total Reward = {total_reward:.4f}")
-            logger.info(f"Episode {episode}: Steps = {steps}")
-            logger.info("Average Reward: {:.4f}".format(np.mean(rewards)))
-            logger.info("Rolling Average Reward: {:.4f}".format(np.mean(all_rewards[-100:])))
+            logger.info("Episode [{}]Average Reward: {:.4f}".format(episode, np.mean(rewards)))
 
             action_history.extend(episode_actions)
 
-            if episode % 10 == 0:
+            if episode % 50 == 0:
+
+                baseline_rewards = self.run_static_baseline()
+
             # Save a plot of the episode reward to tensorboard
                 fig, ax = plt.subplots(figsize=(12, 6))
-                ax.plot(rewards)
+                ax.plot(rewards, label="Policy Reward")
+                ax.plot(baseline_rewards, label="Static Baseline Reward")
                 ax.set_xlabel("Step")
                 ax.set_ylabel("Reward")
                 ax.set_title("Episode Reward")
+                ax.legend()
                 self.writer.add_figure(f"Episode {episode} Reward", fig, episode)
 
                 if not isinstance(action, tuple) :
@@ -397,7 +442,26 @@ class OnPolicyAgent:
                     self.writer.add_figure(f"Episode {episode} Action Histogram", fig, episode)
                     action_history.clear()
 
+                self.writer.add_text(f"Starting Locations episode {episode}", str(starting_locs), episode)
 
+            self.writer.add_text("Episode Actions", str(raw_actions), episode)
             self.writer.add_scalar("Episode Reward", total_reward, episode)
             self.writer.add_scalar("Average Reward", np.mean(rewards), episode)
             self.writer.add_scalar("Rolling Average Reward", np.mean(all_rewards[-20:]), episode)
+
+    def run_static_baseline(self):
+
+        state, _ = self.env.reset()
+        total_reward = 0
+        done = False
+        steps = 0
+        all_rewards = []
+
+        while not done:
+            next_state, reward, done, _, _ = self.env.step((-1,-1))
+            steps += 1
+            total_reward += reward
+            all_rewards.append(reward)
+            self.step += 1
+
+        return all_rewards

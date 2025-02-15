@@ -49,6 +49,21 @@ class DecisionTransformerGraphDataset(Dataset):
         self.state_mean = None
         self.state_std = None
 
+    def save(self, path: str):
+        data = {
+            "trajectories": self.trajectories,
+            "state_mean": self.state_mean,
+            "state_std": self.state_std
+        }
+
+        torch.save(data, path)
+
+    def load(self, path: str):
+        data = torch.load(path)
+        self.trajectories = data["trajectories"]
+        self.state_mean = data["state_mean"]
+        self.state_std = data["state_std"]
+
     def add_trajectory(self, observations, actions, rewards, dones):
         """
         Adds a trajectory to the dataset.
@@ -471,7 +486,7 @@ if __name__ == "__main__":
     config = FluidityEnvironmentConfig(
         jar_path="../../ressources/jars/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
         jvm_options=['-Djava.security.properties=../../ressources/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="../../ressources/simrun_4000/",
+        configuration_directory_simulator="../../ressources/simurun_400/",
         node_identifier="server0",
         device="mps",
         feature_dim_node=1

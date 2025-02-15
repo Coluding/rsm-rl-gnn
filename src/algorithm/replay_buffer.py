@@ -15,8 +15,8 @@ class OffPolicyReplayBuffer:
         self.priority = priority
         self.priorities = deque(maxlen=capacity) if priority else None
 
-    def push(self, state, action, reward, next_state, done, priority=1.0):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self, state, action, reward, next_state, done, timestep, priority=1.0):
+        self.buffer.append((state, action, reward, next_state, done, timestep))
         if self.priority:
             self.priorities.append(priority)
 
@@ -70,3 +70,22 @@ class OnPolicyReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+
+class TrajectoryReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, trajectory):
+        self.buffer.append(trajectory)
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        return batch
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def gen(self, batch_size, shuffle=True):
+        random.shuffle(self.buffer) if shuffle else None
+        for i in range(0, len(self.buffer), batch_size):
+            yield self.buffer[i:i + batch_size]
