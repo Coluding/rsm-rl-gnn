@@ -1,3 +1,5 @@
+import os.path
+import random
 from contextlib import contextmanager
 from typing import List, Union, Any, Dict
 import jpype
@@ -37,7 +39,7 @@ logger = initialize_logger()
 
 class JavaSimulator:
     def __init__(self, jar_path: str, jvm_options: List[str],
-                 configuration_directory_simulator: str,
+                 base_configuration_directory_simulator: str,
                  node_identifier: str = "server0",):
         self.jar_path = jar_path
 
@@ -57,7 +59,8 @@ class JavaSimulator:
         self.LocatedNodeP = "bftsmart/location/LocatedNode"
         self.EnsureCoordinatorP = "bftsmart.location.management.exploration.instructions.EnsureCoordinator"
 
-        self.configuration_directory_simulator = configuration_directory_simulator
+        self.configuration_directories_simulator = [os.path.abspath(os.path.join(base_configuration_directory_simulator, x))
+                                                    for x in os.listdir(base_configuration_directory_simulator)]
         self.node_identifier = node_identifier
         self.jvm_options = jvm_options
 
@@ -70,8 +73,7 @@ class JavaSimulator:
         self._initialize_objects()
         self.internal_step = 0
 
-
-    def _initialize_objects(self):
+    def _initialize_objects(self, randomize_starting_positions: bool = False):
         self.Simulator = jpype.JClass(self.FluiditySimulator)
         self.Simulation = jpype.JClass(self.FluiditySimulation)
         self.ExecutionFactory = jpype.JClass(self.FluiditySimulationExecutionFactory)
@@ -87,9 +89,11 @@ class JavaSimulator:
         self.LocatedNode = jpype.JClass(self.LocatedNodeP)
         self.EnsureCoordinator = jpype.JClass(self.EnsureCoordinatorP)
 
-        self.config_dir = self.Paths.get(self.configuration_directory_simulator + "/" + self.node_identifier)
+        confiuration_directory = random.choice(self.configuration_directories_simulator)
 
-        self.simulator = self.Simulator(self.configuration_directory_simulator, self.node_identifier)
+        self.config_dir = self.Paths.get(confiuration_directory + "/" + self.node_identifier)
+
+        self.simulator = self.Simulator(confiuration_directory, self.node_identifier)
         self.config = self.Config(self.config_dir, self.node_identifier)
         self.simulation = self.Simulation(self.config.getSelf(), self.config.getXmrConfigurationDirectory(),
                                           self.config)
@@ -208,9 +212,9 @@ if __name__ == "__main__":
     conn = JavaSimulator(jvm_options = [
     '-Djava.security.properties=/home/lukas/flusim/simurun/server0/xmr/config/java.security'],
         jar_path="/home/lukas/Projects/emusphere/simulator-xmr/target/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
-        configuration_directory_simulator="/home/lukas/flusim/simurun/"
+        base_configuration_directory_simulator="../../ressources/run_configs/400_steps"
 
     )
 
-    conn.step((4, 0))
-    conn.step((0, 6))
+    conn.step((0, 0))
+    conn.step((0, 0))

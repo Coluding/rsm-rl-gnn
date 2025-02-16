@@ -76,11 +76,11 @@ class Dreamer:
         self.writer = SummaryWriter(comment="dreamer")
 
     def load_model(self, directory: str):
-        self.rssm.load_state_dict(torch.load(directory + "rssm.pth"))
+        self.rssm.load(directory + "rssm.pth")
 
     def save_model(self, directory: str):
         os.makedirs(directory, exist_ok=True)
-        torch.save(self.rssm.state_dict(), directory + "rssm.pth")
+        self.rssm.save(directory + "rssm.pth")
 
     def _process_mask(self, batched_states, B=1):
         location_indices = torch.where(batched_states.label != 0)[0]
@@ -114,18 +114,27 @@ class Dreamer:
             encoded_states = self.rssm.encoder(states).view(actions.shape[0], actions.shape[1], -1)
 
             with torch.no_grad():
+                # the target network is an exponential moving average of the encoder
+                # This is similar to BYOL and avoids collapse of the representation
                 target_encoded_states = self.predictor(states).view(actions.shape[0], actions.shape[1], -1)
 
             actions_ohe = F.one_hot(actions, num_classes=len(self.cross_product_action_space.action_space)).float().squeeze()
             hiddens, prior_states, posterior_states, prior_means, prior_logvars, posterior_means, posterior_logvars = (
                 self.rssm.generate_rollout(actions=actions_ohe, obs=encoded_states, dones=dones))
-            relevant_hiddens = hiddens[:, :-1, :]
-            relevant_posteriors = posterior_states[:, :-1, :]
+
+            # We remove the first elements, as they were zero initialized to enable proper RNN processing
+            # We got from T+1 to T to math the target states length
+            relevant_hiddens = hiddens[:, 1:, :]
+            relevant_posteriors = posterior_states[:, 1:, :]
 
             reward_pred = self.rssm.reward_model(relevant_hiddens, relevant_posteriors)
             encoded_states_pred = self.rssm.decoder(relevant_hiddens, relevant_posteriors)
 
-            kl_loss = self._compute_kl_loss(prior_means, prior_logvars, posterior_means, posterior_logvars)
+            kl_loss = self._compute_kl_loss(
+                prior_means[:, 1:, :], prior_logvars[:, 1:, :],
+                posterior_means[:, 1:, :], posterior_logvars[:, 1:, :]
+            )
+            # ELBO loss: MSE(o_t, o_t_pred)  --> We reconstruct the observation in the latent space, hence o_t = enc(g_t) where g_t is the graph observation
             elbo_loss = self._compute_elbo_loss(encoded_states_pred, target_encoded_states)
             reward_loss = self._compute_reward_loss(reward_pred, rewards)
 
@@ -133,7 +142,7 @@ class Dreamer:
             self.optimizer.zero_grad()
             loss.backward()
 
-            nn.utils.clip_grad_norm_(self.rssm.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(self.rssm.parameters(), 10.0)
 
             self.optimizer.step()
 
@@ -145,7 +154,7 @@ class Dreamer:
                 self.best_loss = loss
                 self.save_model("best/")
 
-            iterator.set_postfix({"Policy Loss": loss.item(), "Value Loss": loss.item()})
+            iterator.set_postfix({"kl_loss": kl_loss.item(), "elbo_loss": elbo_loss.item(), "reward_loss": reward_loss.item()})
             self.training_step += 1
 
             if self.training_step % self.predictor_update_freq == 0:
@@ -167,7 +176,7 @@ class Dreamer:
         return F.mse_loss(reconstruced_obs, target_obs) # assuming gaussian observation model
 
     def _compute_reward_loss(self, reward_pred, target_rewards):
-        return F.mse_loss(reward_pred, target_rewards)
+        return F.mse_loss(reward_pred, target_rewards.float())
 
     def update_predictor(self):
         #TODO Implement this: IT is the exponential moving average of the target network which is the encoder
@@ -182,8 +191,10 @@ class Dreamer:
 
     def select_action(self, state: torch.Tensor) -> int:
         if random.random() < 0.5:
+            # Also sample invalid actions that are connected to high reward (bad, as we want to minimize reward)
             return random.choice(self.cross_product_action_space.action_space)
         else:
+            # Sample from the environment where we only can sample valid actions
             return self.cross_product_action_space[self.env.sample_action()]
 
     def train(self, num_episodes=500):
@@ -248,9 +259,6 @@ class Dreamer:
 
                 if self.step % self.train_every == 0:
                     self.train_step()
-
-
-            logger.info("Episode [{}]Average Reward: {:.4f}".format(episode, np.mean(rewards)))
 
     def evaluate(self):
         state, _ = self.env.reset()
@@ -353,7 +361,7 @@ class Dreamer:
                 dreamed_trajectory["hiddens"].append(hidden.unsqueeze(1))  # (B, 1, hidden_dim)
 
                 # Get next action dynamically (this should come from your policy)
-                action = self.select_action(prior_state)
+                action = self.select_action()
 
                 # Update hidden state using the RNN
                 hidden = self.rssm.dynamics.rnn[0](self.rssm.dynamics.act_fn(
@@ -374,7 +382,7 @@ if __name__ == "__main__":
             jvm_options=['-Djava.security.properties=../../ressources/run_configs/40_steps/simurun/server0/xmr/config/java.security'],
             configuration_directory_simulator="../../ressources/run_configs/40_steps/",
             node_identifier="server0",
-            device="cuda",
+            device="cpu",
             feature_dim_node=1
         )
 

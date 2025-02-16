@@ -3,14 +3,17 @@ from typing import List
 
 class CrossProductActionSpace:
     def __init__(self, num_location: int):
-        self.action_space = [i for i in range(num_location**2 + 1)]
+        self.action_space = [i for i in range(num_location * (num_location - 1) + 1)]
 
         self.action_mapping = {}
+        counter = 0
         for loc1 in range(num_location):
             for loc2 in range(num_location):
-                self.action_mapping[(loc1, loc2)] = loc1 * num_location + loc2
+                if loc1 != loc2:
+                    self.action_mapping[(loc1, loc2)] = counter
+                    counter += 1
 
-        self.action_mapping[(-1, -1)] = num_location**2 # no-op
+        self.action_mapping[(-1, -1)] = len(self.action_space) - 1
 
         self.inv_action_mapping = {v: k for k, v in self.action_mapping.items()}
         self.num_location = num_location

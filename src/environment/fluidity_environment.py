@@ -1,3 +1,5 @@
+import os
+
 import gym
 from gym import Env
 from gym import spaces
@@ -27,7 +29,7 @@ class FluidityEnvironmentConfig:
     node_identifier: str
     device: str
     feature_dim_node: int = 1
-    reconfiguration_costs: float = 50
+    reconfiguration_costs: float = 25
 
 logger = initialize_logger(log_file="fluidity.environment.log", log_level="INFO")
 
@@ -104,7 +106,7 @@ class FluidityEnvironment(Env):
         self.simulator = JavaSimulator(
             jar_path=self.config.jar_path,
             jvm_options=self.config.jvm_options,
-            configuration_directory_simulator=self.config.configuration_directory_simulator,
+            base_configuration_directory_simulator=self.config.configuration_directory_simulator,
             node_identifier=self.config.node_identifier
         )
 
@@ -132,14 +134,15 @@ class FluidityEnvironment(Env):
         self.observation_space = spaces.Graph(node_space=request_feature, edge_space=self.edge_features)
         self.graph = nx.Graph()
 
-    def sample_action(self) -> Tuple[int, int]:
+    def sample_action(self, crss_product: bool = False) -> Tuple[int, int]:
         # Randomly sample an action from the action space
         # We also want to have a certain probability for no-op
         if len(self.active_locations) < 1:
             return (0, 0)
 
-        if np.random.rand() < 0.1:
-            return self.inv_loc_mapping[self.active_locations[0]], self.inv_loc_mapping[self.active_locations[0]]
+        if np.random.rand() < 0.15:
+            return (self.inv_loc_mapping[self.active_locations[0]], self.inv_loc_mapping[self.active_locations[0]]) \
+                if crss_product is None else (-1,-1)
 
         add_action = random.choice(list(set(self.loc_mapping.values()) - set(self.active_locations)))
         remove_action = random.choice(self.active_locations)
@@ -178,7 +181,7 @@ class FluidityEnvironment(Env):
 
         observation = self._build_graph_from_observation(processed_observation)
         done = raw_observation.finished
-        return observation, -reward, done, {}, {}
+        return observation, reward, done, {}, {}
 
     def reset(self, **kwargs) -> ObsType:
         raw_observation = self.simulator.step((0, 0))
@@ -258,7 +261,9 @@ class FluidityEnvironment(Env):
         return G
 
     def _initialize_locations(self):
-        with open(self.config.configuration_directory_simulator + "server0/xmr/config/locations.config", "r") as f: #TODO: Change this to a more general path
+        config_dir = os.path.join(self.config.configuration_directory_simulator,
+                                  os.listdir(self.config.configuration_directory_simulator)[0])
+        with open(config_dir + "/server0/xmr/config/locations.config", "r") as f: #TODO: Change this to a more general path
             locs = f.readlines()
 
         locs = [x.strip("\n") for x in locs]
@@ -357,26 +362,36 @@ class StackedBatchObservationWrapper(TorchGraphObservationWrapper):
 
 if __name__ == "__main__":
     config = FluidityEnvironmentConfig(
-        jar_path="/Users/lukasbierling/PycharmProjects/rsm-rl-gnn/ressources/jars/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
-        jvm_options=['-Djava.security.properties=/Users/lukasbierling/PycharmProjects/rsm-rl-gnn/ressources/simurun/server0/xmr/config/java.security'],
-        configuration_directory_simulator="/Users/lukasbierling/PycharmProjects/rsm-rl-gnn/ressources/simurun/",
+        jar_path="../../ressources/jars/simulator-xmr-0.0.1-SNAPSHOT-jar-with-dependencies.jar",
+        jvm_options=['-Djava.security.properties=../../ressources/run_configs/40_steps/simurun/server0/xmr/config/java.security'],
+        configuration_directory_simulator="../../ressources/run_configs/40_steps/",
         node_identifier="server0",
         device="cpu",
         feature_dim_node=1
     )
 
+    tot_reward = []
     env = FluidityEnvironment(config)
     env = TorchGraphObservationWrapper(env, one_hot=False)
     env = StackedObservationWrapper(env, stack_size=3)
     obs = env.reset()
+    logger.info(env.active_locations)
     obs, reward, done, _, _ = env.step((-1, -1))
+    tot_reward.append(reward)
     logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((0, 4))
+    obs, reward, done, _, _ = env.step((-1, -1))
+    tot_reward.append(reward)
     logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((4, 0))
+    obs, reward, done, _, _ = env.step((-1, -1))
+    tot_reward.append(reward)
     logger.info(f"Reward: {reward}")
-    obs, reward, done, _, _ = env.step((0, 4))
+    obs, reward, done, _, _ = env.step((-1, -1))
+    tot_reward.append(reward)
     logger.info(f"Reward: {reward}")
-    for i in range(2000):
+    for i in range(36):
         obs, reward, done, _, _ = env.step((0, 0))
-        logger.info(f"Step {i}, Reward: {reward}")
+        tot_reward.append(reward)
+        logger.info(f"Step {i + 4}, Reward: {reward}")
+
+    print("-------------------------------------")
+    print(np.mean(tot_reward))

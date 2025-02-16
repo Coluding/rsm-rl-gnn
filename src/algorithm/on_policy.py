@@ -397,7 +397,7 @@ class OnPolicyAgent:
                 next_state = next_state.to(self.device)
                 steps += 1
                 #episode_buffer.append((state, action, log_prob, reward, next_state, done))
-                self.replay_buffer.push(state, action, log_prob, -reward, next_state, done, steps)
+                self.replay_buffer.push(state, action, log_prob, reward, next_state, done, steps)
                 state = next_state
                 total_reward += reward
                 rewards.append(reward)

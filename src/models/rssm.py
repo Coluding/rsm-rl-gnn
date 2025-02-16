@@ -10,7 +10,7 @@ class DynamicsModel(nn.Module):
     """
     This is the dynamics model of the RSSM.
     """
-    def __init__(self, hidden_dim: int, action_dim: int, state_dim: int, embedding_dim: int, rnn_layer: int = 1):
+    def __init__(self, hidden_dim: int, action_dim: int, state_dim: int, obs_dim: int, rnn_layer: int = 1):
         super().__init__()
 
         self.hidden_dim = hidden_dim
@@ -27,7 +27,7 @@ class DynamicsModel(nn.Module):
 
         # Return mean and log-variance of the normal distribution
         self.posterior = nn.Linear(hidden_dim, state_dim * 2)
-        self.project_hidden_obs = nn.Linear(hidden_dim + embedding_dim, hidden_dim)
+        self.project_hidden_obs = nn.Linear(hidden_dim + obs_dim, hidden_dim)
 
         self.state_dim = state_dim
         self.act_fn = nn.functional.gelu
@@ -70,68 +70,82 @@ class DynamicsModel(nn.Module):
             state_action = self.act_fn(self.project_state_action(state_action))
 
             ### Update the deterministic hidden state ###
-            for i in range(len(self.rnn)):
-                hidden_t = self.rnn[i](state_action, hidden_t)
+            for rnn in self.rnn:
+                # h_t = f(h_{t-1}, s_{t-1}, a_{t-1})
+                hidden_t = rnn(state_action, hidden_t)
 
-                ### Determine the prior distribution ###
-                hidden_action = torch.cat([hidden_t, action_t], dim=-1)
-                hidden_action = self.act_fn(self.project_hidden_action(hidden_action))
-                prior_params = self.prior(hidden_action)
-                prior_mean, prior_logvar = torch.chunk(prior_params, 2, dim=-1)
+            ### Determine the prior distribution ###
+            hidden_action = torch.cat([hidden_t, action_t], dim=-1)
+            # p(s_t | s_{t-1}, a_{t-1}) -- prior
+            hidden_action = self.act_fn(self.project_hidden_action(hidden_action))
+            prior_params = self.prior(hidden_action)
+            prior_mean, prior_logvar = torch.chunk(prior_params, 2, dim=-1)
 
-                ### Sample from the prior distribution ###
-                prior_dist = torch.distributions.Normal(prior_mean, torch.exp(F.softplus(prior_logvar)))
-                prior_state_t = prior_dist.rsample()
+            ### Sample from the prior distribution ###
+            prior_dist = torch.distributions.Normal(prior_mean, torch.exp(F.softplus(prior_logvar)))
+            prior_state_t = prior_dist.rsample()
 
-                ### Determine the posterior distribution ###
-                # If observations are not available, we just use the prior
-                if obs is None:
-                    posterior_mean = prior_mean
-                    posterior_logvar = prior_logvar
-                else:
-                    hidden_obs = torch.cat([hidden_t, obs_t], dim=-1)
-                    hidden_obs = self.act_fn(self.project_hidden_obs(hidden_obs))
-                    posterior_params = self.posterior(hidden_obs)
-                    posterior_mean, posterior_logvar = torch.chunk(posterior_params, 2, dim=-1)
+            ### Determine the posterior distribution ###
+            # If observations are not available, we just use the prior
+            if obs is None:
+                posterior_mean = prior_mean
+                posterior_logvar = prior_logvar
+            else:
+                # p(s_t | s_{t-1}, a_{t-1}, o_t) -- posterior --> Only if observations are available
+                # If not we can sample form the prior
+                hidden_obs = torch.cat([hidden_t, obs_t], dim=-1)
+                hidden_obs = self.act_fn(self.project_hidden_obs(hidden_obs))
+                posterior_params = self.posterior(hidden_obs)
+                posterior_mean, posterior_logvar = torch.chunk(posterior_params, 2, dim=-1)
 
-                ### Sample from the posterior distribution ###
-                posterior_dist = torch.distributions.Normal(posterior_mean, torch.exp(F.softplus(posterior_logvar)))
+            ### Sample from the posterior distribution ###
+            posterior_dist = torch.distributions.Normal(posterior_mean, torch.exp(F.softplus(posterior_logvar)))
 
-                # Make sure to use rsample to enable the gradient flow
-                # Otherwise you could also use code the reparameterization trick by hand
-                posterior_state_t = posterior_dist.rsample()
+            # Make sure to use rsample to enable the gradient flow
+            # Otherwise we could also use code the reparameterization trick by hand
+            posterior_state_t = posterior_dist.rsample()
 
-                ### Store results in lists (instead of in-place modification) ###
-                posterior_means_list.append(posterior_mean.unsqueeze(1))
-                posterior_logvars_list.append(posterior_logvar.unsqueeze(1))
-                prior_means_list.append(prior_mean.unsqueeze(1))
-                prior_logvars_list.append(prior_logvar.unsqueeze(1))
-                prior_states_list.append(prior_state_t.unsqueeze(1))
-                posterior_states_list.append(posterior_state_t.unsqueeze(1))
-                hiddens_list.append(hidden_t.unsqueeze(1))
+            ### Store results in lists (instead of in-place modification) ###
+            posterior_means_list.append(posterior_mean.unsqueeze(1))
+            posterior_logvars_list.append(posterior_logvar.unsqueeze(1))
+            prior_means_list.append(prior_mean.unsqueeze(1))
+            prior_logvars_list.append(prior_logvar.unsqueeze(1))
+            prior_states_list.append(prior_state_t.unsqueeze(1))
+            posterior_states_list.append(posterior_state_t.unsqueeze(1))
+            hiddens_list.append(hidden_t.unsqueeze(1))
 
-                # Convert lists to tensors using torch.cat()
-            hiddens = torch.cat(hiddens_list, dim=1)
-            prior_states = torch.cat(prior_states_list, dim=1)
-            posterior_states = torch.cat(posterior_states_list, dim=1)
-            prior_means = torch.cat(prior_means_list, dim=1)
-            prior_logvars = torch.cat(prior_logvars_list, dim=1)
-            posterior_means = torch.cat(posterior_means_list, dim=1)
-            posterior_logvars = torch.cat(posterior_logvars_list, dim=1)
+            # Convert lists to tensors using torch.cat()
+        hiddens = torch.cat(hiddens_list, dim=1)
+        prior_states = torch.cat(prior_states_list, dim=1)
+        posterior_states = torch.cat(posterior_states_list, dim=1)
+        prior_means = torch.cat(prior_means_list, dim=1)
+        prior_logvars = torch.cat(prior_logvars_list, dim=1)
+        posterior_means = torch.cat(posterior_means_list, dim=1)
+        posterior_logvars = torch.cat(posterior_logvars_list, dim=1)
 
-            return hiddens, prior_states, posterior_states, prior_means, prior_logvars, posterior_means, posterior_logvars
+        return hiddens, prior_states, posterior_states, prior_means, prior_logvars, posterior_means, posterior_logvars
 
 
 class LatentDecoder(nn.Module):
     """
     This is a simple decoder that maps the recurrent hidden state to the latent space of the graph.
     """
-    def __init__(self, hidden_dim: int, state_dim: int):
-        super().__init__()
-        self.decoder = nn.Linear(hidden_dim, state_dim)
 
-    def forward(self, hiddens: torch.Tensor):
-        return self.decoder(hiddens)
+    def __init__(self, hidden_dim: int, state_dim: int, embedding_dim: int):
+        super(LatentDecoder, self).__init__()
+
+        self.fc1 = nn.Linear(hidden_dim + state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, embedding_dim)
+
+    def forward(self, h: torch.Tensor, s: torch.Tensor):
+        x = torch.cat([h, s], dim=-1)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+
+        return x
+
 
 
 
@@ -165,7 +179,7 @@ class RewardModel(nn.Module):
 
         self.fc1 = nn.Linear(hidden_dim + state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 2)
+        self.fc3 = nn.Linear(hidden_dim, 1)
 
     def forward(self, h: torch.Tensor, s: torch.Tensor):
         x = torch.cat([h, s], dim=-1)
